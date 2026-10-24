@@ -1,0 +1,2 @@
+# No torch or OpenAI account needed for the local HTTP backend.
+jinja2>=3.1

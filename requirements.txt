@@ -1,0 +1,5 @@
+# Install a CUDA-compatible PyTorch separately when necessary.
+torch>=2.6
+transformers>=4.51,<5
+safetensors
+jinja2>=3.1

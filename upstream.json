@@ -1,0 +1,9 @@
+{
+  "url": "https://raw.githubusercontent.com/StonyBrookNLP/appworld/08132046efd85186e250e270d061a04d719605ee/notebooks/minimal_agent.ipynb",
+  "commit": "08132046efd85186e250e270d061a04d719605ee",
+  "notebook_sha256": "f84ecc57509e6396bdfb814055c3dedb9328c743facca0bfd9b7436d7d378182",
+  "changes": [
+    "Assign passwords before reusing it",
+    "Fix Spotify password list comprehension"
+  ]
+}
