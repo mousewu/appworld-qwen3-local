@@ -1,0 +1,4 @@
+-r requirements.txt
+peft>=0.15,<1
+datasets>=3,<5
+accelerate>=1.2,<2

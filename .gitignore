@@ -1,3 +1,5 @@
 __pycache__/
 runs/
 .venv/
+sft_data/
+sft_outputs/

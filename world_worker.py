@@ -34,6 +34,8 @@ def main():
                 from appworld import AppWorld, load_task_ids
                 if command == 'list':
                     result = load_task_ids(request['split'])
+                elif command == 'read_trajectory':
+                    result = AppWorld.parse_environment_io_log(file_path=request['path'])
                 elif command == 'reset':
                     if world is not None:
                         world.close()

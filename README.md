@@ -174,3 +174,91 @@ python run_agent.py --help
 - Qwen3-4B：https://huggingface.co/Qwen/Qwen3-4B
 
 `prompt_template.txt` 改编自 AppWorld 官方 notebook，版权归原作者，遵循上游 Apache-2.0 许可；保留 `upstream.json` 以追踪来源。
+
+## Official GPT-4o Train → Qwen3 LoRA SFT
+
+The converter uses the **executed** Python in official `logs/environment_io.md`, not
+Markdown/prose from teacher messages. It reuses this project's `prompt_messages`
+and execution feedback, emits raw Python (the current prompt asks for no fences),
+and obtains fresh observations by replaying each complete trajectory. Only trajectories
+whose fresh `world.evaluate().success` is true are exported. Successful trajectories
+can contain intermediate execution failures: these are preserved to teach recovery.
+Invalid Python rejects the whole trajectory instead of silently deleting dependent steps.
+No evaluator answers or test reports are placed in model inputs.
+
+Official source: <https://github.com/StonyBrookNLP/appworld#-downloading-our-experiment-outputs>.
+Parsing uses the installed SDK's `AppWorld.parse_environment_io_log(file_path=...)`.
+Older SDKs without that method produce explicit audit errors; upgrade to a compatible
+AppWorld release rather than guessing the log format.
+
+### 1. Download in the AppWorld environment
+
+```bash
+/opt/conda/envs/appworld/bin/appworld download experiment-outputs \
+  --root /home/notebook/data/group/decision_model/code/appworld
+```
+
+This official download also includes Dev/Test outputs. The converter only enumerates
+`load_task_ids('train')` from your installed version and opens those task paths.
+Do not point `--experiment` at Dev/Test experiments. Missing Train logs are audited,
+never replaced with another split. Old bundles may have a different task list or layout;
+inspect `audit.jsonl` if nothing is exported. Source data is not included in this repo.
+
+### 2. Replay and convert (no GPU needed)
+
+Run from this repository, with Jinja2 installed in the launcher Python:
+
+```bash
+/opt/conda/bin/python convert_official_sft.py \
+  --appworld-python /opt/conda/envs/appworld/bin/python \
+  --appworld-root /home/notebook/data/group/decision_model/code/appworld \
+  --output-dir sft_data/official_gpt4o
+```
+
+Default experiment: `simplified_react_code_agent_gpt-4o-2024-05-13_train`.
+Use `--experiment` only for another official **Train** experiment directory.
+Replay outputs use a unique `sft_replay/...` experiment; original logs are read-only.
+The output directory must be empty. Outputs:
+
+- `train.jsonl`: one history → next-code example per executed turn, with task/scenario IDs.
+- `audit.jsonl`: each Train task's missing/error/failure/success status, source hash,
+  fresh evaluation, and installed runtime metadata.
+- `summary.json`: counts, source, replay name, seed, and current prompt hash.
+
+Replay validates success on the installed SDK, not the historical GPT-4o score.
+Version differences can cause rejection. The converter does not invoke another model
+or repair teacher logic. It tries every installed Train ID; audit errors are not successes.
+
+### 3. Train in the LLM environment
+
+```bash
+/opt/conda/bin/python -m pip install -r requirements-sft.txt
+bash run_sft_lora.sh
+```
+
+Defaults match the server paths used in this project. Override `LLM_PYTHON`, `MODEL_PATH`,
+`DATA_PATH`, `OUTPUT_DIR`, `MERGE_OUTPUT`, `MAX_LENGTH`, `EPOCHS`, `BATCH_SIZE`, or
+`GRAD_ACCUM` as needed. Training requires a CUDA GPU supporting BF16. Start with one
+24–48 GB GPU, batch size 1, gradient checkpointing, LoRA rank 16, length 8192;
+actual memory depends on sequence lengths and installed kernels. If memory is tight,
+reduce `MAX_LENGTH` to 4096 (more examples will be skipped). This is BF16 LoRA, not QLoRA.
+No AppWorld installation is required in the LLM environment.
+
+Each example supervises **only the final assistant completion and its template end marker**.
+All earlier assistant turns (including few-shot examples), user messages, and observations
+have label `-100`. Qwen chat formatting uses `enable_thinking=False` just like inference.
+The script checks that the inference prompt token IDs are an exact prefix of the full
+training sequence. Overlength examples are skipped whole, with counts saved in
+`data_stats.json`; no left/right truncation or packing is performed. Padding is masked.
+
+The output folder contains the PEFT adapter. The shell script also exports a merged
+standalone model to `sft_outputs/qwen3_4b_merged`; pass this directory as `--model` to
+`run_agent.py` or set `MODEL_PATH` when using `run_train_all.sh`. Export needs additional
+disk space for the full 4B model. For adapter-only training, call `train_lora.py` directly
+without `--merge-output`.
+
+Start with one epoch and compare against the base model on Dev; do not use Dev/Test
+trajectories as SFT targets. Do not randomly split individual turns: if holding out
+Train data, group all three variants of a scenario together. Training loss alone is
+not a measure of task success. Local validation here covers mocks and conversion/masking
+logic; real official bundle replay and CUDA training must be verified on your server.
