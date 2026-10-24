@@ -75,6 +75,28 @@ python run_agent.py --backend api \
 
 ## 4. 更多任务与输出
 
+### 遍历全部 Train，每任务一次
+
+在已配置的服务器上可直接执行：
+
+```bash
+bash run_train_all.sh
+# 查看每轮代码与观察（日志始终写入文件，verbose 只影响控制台）：
+bash run_train_all.sh --verbose
+```
+
+脚本中的默认路径匹配当前服务器；其他机器可通过 `LLM_PYTHON`、`MODEL_PATH`、`APPWORLD_PYTHON`、`APPWORLD_ROOT` 环境变量覆盖。它使用 `--split train --all-tasks`，加载实际任务清单并逐一运行，**不抽样、不重复任务**。官方原始 Train 约 105 个任务，不会把重复执行算成 500 个独立任务。
+
+任一接入模式均支持 `--all-tasks`，与 `--limit` 互斥；旧的 `--limit 0` 也继续有效。模型权重只加载一次，各任务使用独立 AppWorld 子进程。运行中每个任务完成后保存统计，普通单任务异常记录后继续下一个任务；不支持从中断位置自动续跑。
+
+### 反馈与统计
+
+语法/格式错误明确标记 `CODE NOT EXECUTED`，包含出错行，并说明本轮没有执行任何 API，不代表接口或文档不存在。实际环境反馈标记 `CODE WAS SUBMITTED`，日志同时保存原始环境输出及 `feedback_kind`。不会自动修改或执行语法错误代码。
+
+`summary.json` 新增：计划/已完成/独立任务数、成功数、成功率、评测完成数、基础设施错误数、终止原因、平均轮数、成功任务平均轮数、格式错误数/比例、环境执行错误数/比例、认证错误数、累计用时。格式错误比例以模型输出轮数为分母；执行错误比例以实际提交执行次数为分母。认证错误基于环境输出中的 HTTP 401/403 状态标记，不把模型自述算作认证错误。
+
+`results.csv` 保存每任务对应指标，方便后续表格分析。汇总成功率包含出错任务；`completed=false` 表示尚未处理完计划清单。检查通过数保留在任务结果中，但不是任务完成百分比。当前不输出二项置信区间，也不将 Train 成功率称为泛化成绩。
+
 ```bash
 # 先查看当前 split 的实际任务 ID（在 AppWorld 环境中）
 python -c 'from appworld import load_task_ids; print(load_task_ids("train"))'
@@ -93,6 +115,7 @@ python run_agent.py --model /path/to/Qwen3-4B \
 - `config.json`：配置、任务清单、上游来源，不保存 API Key。
 - `<task_id>.jsonl`：初始提示、原始模型输出、实际执行代码、观察、生成元数据和评测结果。
 - `summary.json`：每任务是否宣告完成、验证是否成功、轮数、结束原因和错误；成功率分母包括出错任务，另列 error 数。
+- `results.csv`：每任务结果与错误类别统计。
 
 Transformers 路径保存 prompt/completion token IDs；API 路径保存服务 usage。**这不是 PPO 训练器**，未导出完整采样 log_probs 或 token loss_mask，不能直接作为精确 PPO rollout 使用。普通成功轨迹 SFT 可基于日志进一步转换；训练采样需要另加对齐与概率记录。
 

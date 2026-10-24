@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 from collections.abc import Mapping
+import csv
 import ipaddress
 import json
 import os
@@ -95,6 +97,70 @@ def extract_code(text):
         text = (fenced or tagged)[0].strip()
     ast.parse(text)
     return text
+
+
+def format_error_feedback(exc):
+    location = ''
+    if isinstance(exc, SyntaxError):
+        location = f'\nPython syntax error at line {exc.lineno}: {exc.msg}'
+        if exc.text:
+            location += '\nProblematic line: ' + exc.text.strip()
+    else:
+        location = '\nFormat error: ' + str(exc)
+    return ('[AGENT OUTPUT FORMAT ERROR — CODE NOT EXECUTED]\n'
+        'Your previous response was rejected before execution. NO Python statement or API call '
+        'from that response ran. This is NOT an AppWorld API error, authentication failure, '
+        'or evidence that an API/documentation is unavailable.' + location + '\n'
+        'Retry the intended operation with valid Python only. Put EVERY explanation line behind # '
+        'or omit explanations. Do not change your API plan merely because of this formatting error. '
+        'Return one complete Python code block; do not invent the result of the unexecuted call.')
+
+
+def execution_feedback(observation):
+    failed = observation.lstrip().startswith('Execution failed')
+    header = ('[APPWORLD EXECUTION ERROR — CODE WAS SUBMITTED]' if failed else
+              '[APPWORLD EXECUTION OUTPUT — CODE WAS SUBMITTED]')
+    return header + '\n' + observation, failed
+
+
+def build_summary(results, planned):
+    n = len(results)
+    successes = [r for r in results if r['success']]
+    steps = sum(r['steps'] for r in results)
+    executed = sum(r.get('executed_steps', 0) for r in results)
+    return dict(results=results, planned_tasks=planned, tasks=n, unique_tasks=len({r['task_id'] for r in results}),
+        evaluated=sum(r['evaluated'] for r in results), successes=len(successes),
+        failures=n-len(successes), errors=sum(r['termination'] == 'error' for r in results),
+        success_rate=len(successes)/n if n else 0.,
+        # Errors remain in the denominator; no silent exclusion of failed runs.
+        termination_counts=dict(Counter(r['termination'] for r in results)),
+        failure_termination_counts=dict(Counter(r['termination'] for r in results if not r['success'])),
+        total_turns=steps, average_turns=steps/n if n else 0.,
+        average_success_turns=(sum(r['steps'] for r in successes)/len(successes) if successes else None),
+        total_executed_steps=executed,
+        format_errors=sum(r.get('format_errors', 0) for r in results),
+        format_error_rate=(sum(r.get('format_errors', 0) for r in results)/steps if steps else 0.),
+        execution_errors=sum(r.get('execution_errors', 0) for r in results),
+        execution_error_rate=(sum(r.get('execution_errors', 0) for r in results)/executed if executed else 0.),
+        authentication_errors=sum(r.get('authentication_errors', 0) for r in results),
+        seconds=sum(r['seconds'] for r in results),
+        completed=n == planned)
+
+
+def save_results(out, results, planned):
+    summary = build_summary(results, planned)
+    temp = out / 'summary.json.tmp'
+    temp.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + '\n')
+    temp.replace(out / 'summary.json')
+    fields = ['task_id', 'success', 'evaluated', 'declared_done', 'termination', 'steps',
+              'executed_steps', 'format_errors', 'execution_errors', 'authentication_errors',
+              'passed_checks', 'total_checks', 'seconds', 'error']
+    with (out / 'results.csv.tmp').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(results)
+    (out / 'results.csv.tmp').replace(out / 'results.csv')
+    return summary
 
 
 class WorldProcess:
@@ -229,6 +295,7 @@ def run_episode(args, backend, task_id, run_name, out_dir):
     worker = WorldProcess(args.appworld_python, args.appworld_root, args.env_timeout)
     result = dict(task_id=task_id, experiment_name=run_name,
         success=False, evaluated=False, declared_done=False, steps=0,
+        executed_steps=0, format_errors=0, execution_errors=0, authentication_errors=0,
         termination='error', error=None)
     path = out_dir / f'{task_id}.jsonl'
     started = time.monotonic()
@@ -252,16 +319,25 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                     code = extract_code(raw)
                 except (ValueError, SyntaxError) as exc:
                     code = None
-                    observation = 'Invalid Python response: ' + str(exc) + (
-                        '\nReturn one complete Python code block. Put reasoning in Python comments.')
+                    result['format_errors'] += 1
+                    observation = format_error_feedback(exc)
+                    raw_observation = None
+                    feedback_kind = 'format_error'
                     declared_done = False
                 else:
                     execution = worker.call('execute', code=code)
-                    observation = execution['observation']
+                    result['executed_steps'] += 1
+                    raw_observation = execution['observation']
+                    observation, execution_failed = execution_feedback(raw_observation)
+                    feedback_kind = 'execution_error' if execution_failed else 'execution_output'
+                    result['execution_errors'] += int(execution_failed)
+                    result['authentication_errors'] += int(bool(re.search(
+                        r'Response status code is\s+(401|403)\b', raw_observation)))
                     declared_done = execution['declared_done']
                 result['steps'] = step
                 record(dict(type='turn', step=step, raw_completion=raw,
                     executed_code=code, observation=observation,
+                    raw_observation=raw_observation, feedback_kind=feedback_kind,
                     declared_done=declared_done, generation=generation))
                 print(f'{task_id} turn {step}/{args.max_steps}: '
                     f'{"declared done" if declared_done else "continuing"}', flush=True)
@@ -277,7 +353,6 @@ def run_episode(args, backend, task_id, run_name, out_dir):
             evaluation = worker.call('evaluate')
             result.update(evaluated=True, success=evaluation['success'],
                 passed_checks=evaluation['passed_checks'], total_checks=evaluation['total_checks'])
-            record(dict(type='result', **result))
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         result['error'] = f'{type(exc).__name__}: {exc}'
@@ -292,6 +367,9 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                 pass
         worker.close()
     result['seconds'] = round(time.monotonic() - started, 3)
+    # Write terminal status even when a model/worker error interrupts the loop.
+    with path.open('a') as stream:
+        stream.write(json.dumps(dict(type='result', **result), ensure_ascii=False) + '\n')
     return result
 
 
@@ -307,7 +385,9 @@ def parse_args():
     p.add_argument('--appworld-root', type=Path, required=True)
     p.add_argument('--split', choices=['train', 'dev', 'test_normal', 'test_challenge'], default='train')
     p.add_argument('--task-id', action='append', help='Repeat to select tasks within --split')
-    p.add_argument('--limit', type=int, default=1, help='Default: one task; 0 means all selected tasks')
+    selection = p.add_mutually_exclusive_group()
+    selection.add_argument('--limit', type=int, default=1, help='Default: one task; 0 means all selected tasks')
+    selection.add_argument('--all-tasks', action='store_true', help='Run every task in the selected split once')
     p.add_argument('--max-steps', type=int, default=50)
     p.add_argument('--max-new-tokens', type=int, default=1024)
     p.add_argument('--context-length', type=int, default=32768)
@@ -321,6 +401,8 @@ def parse_args():
     p.add_argument('--check-env', action='store_true',
         help='Reset one task, execute a smoke check, evaluate and exit without loading the LLM')
     a = p.parse_args()
+    if a.all_tasks:
+        a.limit = 0
     if a.backend == 'transformers' and not a.model and not a.check_env:
         p.error('--model is required for Transformers')
     if min(a.max_steps, a.max_new_tokens, a.context_length, a.env_timeout, a.model_timeout) <= 0:
@@ -369,15 +451,17 @@ def main():
         upstream=json.loads((HERE / 'upstream.json').read_text())), indent=2) + '\n')
     backend = TransformersBackend(args) if args.backend == 'transformers' else LocalAPIBackend(args)
     results = []
-    for task in tasks:
+    save_results(out, results, len(tasks))
+    for index, task in enumerate(tasks, 1):
+        print(f'\n=== Task {index}/{len(tasks)}: {task} ===', flush=True)
         result = run_episode(args, backend, task, run_name, out)
         results.append(result)
         print(json.dumps(result, ensure_ascii=False), flush=True)
-        summary = dict(results=results, tasks=len(results),
-            evaluated=sum(r['evaluated'] for r in results),
-            errors=sum(r['termination'] == 'error' for r in results),
-            success_rate=sum(r['success'] for r in results) / len(results))
-        (out / 'summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False) + '\n')
+        summary = save_results(out, results, len(tasks))
+        print(f'Progress {index}/{len(tasks)} | success {summary["successes"]}/{index} '
+              f'({summary["success_rate"]:.1%}) | format errors {summary["format_errors"]} '
+              f'| execution errors {summary["execution_errors"]} '
+              f'| run errors {summary["errors"]}', flush=True)
     print(f'Results: {out}')
     return 1 if any(r['termination'] == 'error' for r in results) else 0
 

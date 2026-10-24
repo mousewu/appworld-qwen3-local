@@ -5,12 +5,15 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import contextlib
+import io
 from unittest.mock import patch
 from types import SimpleNamespace
 
 from run_agent import (WorldProcess, extract_code, prompt_messages,
                        run_episode, LocalAPIBackend, ContextLimit,
-                       normalize_input_ids, chat_input_ids, model_dtype_kwargs)
+                       normalize_input_ids, chat_input_ids, model_dtype_kwargs,
+                       build_summary, main)
 from world_worker import world_kwargs
 
 
@@ -39,6 +42,73 @@ class AppWorld:
 
 
 class AgentTests(unittest.TestCase):
+    def test_syntax_retry_is_not_an_api_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'appworld.py').write_text(FAKE_WORLD)
+            with patch.dict(os.environ, {'PYTHONPATH': str(root)}):
+                class Backend:
+                    calls = 0
+                    def generate(self, messages):
+                        self.calls += 1
+                        if self.calls == 1:
+                            return 'Looking at the API, I will login.\nprint(1)', {}
+                        feedback = messages[-1]['content']
+                        assert 'CODE NOT EXECUTED' in feedback
+                        assert 'NO Python statement or API call' in feedback
+                        assert 'NOT an AppWorld API error' in feedback
+                        return 'apis.supervisor.complete_task()', {}
+                args = SimpleNamespace(appworld_python=sys.executable, appworld_root=root,
+                    env_timeout=10, max_steps=3, seed=123, verbose=False)
+                result = run_episode(args, Backend(), 'fake_task_1', 'retry', root)
+                self.assertEqual(result['steps'], 2)
+                self.assertEqual(result['format_errors'], 1)
+                self.assertEqual(result['executed_steps'], 1)
+                self.assertEqual(result['execution_errors'], 0)
+                rows = [json.loads(x) for x in (root / 'fake_task_1.jsonl').read_text().splitlines()]
+                self.assertEqual(rows[1]['feedback_kind'], 'format_error')
+                self.assertIsNone(rows[1]['executed_code'])
+                self.assertEqual(rows[2]['feedback_kind'], 'execution_output')
+
+    def test_summary_keeps_errors_in_denominator(self):
+        rows = [dict(task_id='a', success=True, evaluated=True, termination='declared_done',
+                     steps=4, executed_steps=3, format_errors=1, execution_errors=1,
+                     authentication_errors=1, seconds=2),
+                dict(task_id='b', success=False, evaluated=False, termination='error',
+                     steps=0, seconds=1)]
+        summary = build_summary(rows, 3)
+        self.assertEqual(summary['success_rate'], .5)
+        self.assertEqual(summary['format_error_rate'], .25)
+        self.assertAlmostEqual(summary['execution_error_rate'], 1/3)
+        self.assertEqual(summary['unique_tasks'], 2)
+        self.assertEqual(summary['average_success_turns'], 4)
+        self.assertFalse(summary['completed'])
+
+    def test_all_tasks_cli_writes_complete_summary_and_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FAKE_WORLD.replace('return ["fake_task_1"]',
+                                      'return ["fake_task_1", "fake_task_2"]')
+            (root / 'appworld.py').write_text(fake)
+            class Backend:
+                def generate(self, messages): return 'apis.supervisor.complete_task()', {}
+            argv = ['run_agent.py', '--backend', 'api', '--appworld-root', str(root),
+                    '--all-tasks', '--output-dir', str(root / 'out')]
+            with patch.dict(os.environ, {'PYTHONPATH': str(root)}), \
+                 patch.object(sys, 'argv', argv), \
+                 patch('run_agent.LocalAPIBackend', return_value=Backend()), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(), 0)
+            output = next((root / 'out').iterdir())
+            summary = json.loads((output / 'summary.json').read_text())
+            self.assertEqual(summary['tasks'], 2)
+            self.assertEqual(summary['unique_tasks'], 2)
+            self.assertEqual(summary['evaluated'], 2)
+            self.assertTrue(summary['completed'])
+            self.assertEqual(len((output / 'results.csv').read_text().splitlines()), 3)
+            self.assertTrue((output / 'fake_task_1.jsonl').is_file())
+            self.assertTrue((output / 'fake_task_2.jsonl').is_file())
+
     def test_tokenizer_encoding_formats(self):
         class Encoding:
             ids = [10, 20, 30]
