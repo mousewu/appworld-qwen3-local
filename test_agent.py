@@ -9,7 +9,8 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from run_agent import (WorldProcess, extract_code, prompt_messages,
-                       run_episode, LocalAPIBackend, ContextLimit)
+                       run_episode, LocalAPIBackend, ContextLimit,
+                       normalize_input_ids, chat_input_ids, model_dtype_kwargs)
 from world_worker import world_kwargs
 
 
@@ -38,6 +39,38 @@ class AppWorld:
 
 
 class AgentTests(unittest.TestCase):
+    def test_tokenizer_encoding_formats(self):
+        class Encoding:
+            ids = [10, 20, 30]
+        class Tensor:
+            def tolist(self): return [[10, 20, 30]]
+        for encoded in ([10, 20, 30], [[10, 20, 30]], Encoding(), [Encoding()],
+                        {'input_ids': Encoding()}, {'input_ids': [[10, 20, 30]]}, Tensor()):
+            with self.subTest(encoded=type(encoded).__name__):
+                self.assertEqual(normalize_input_ids(encoded), [10, 20, 30])
+        for invalid in ([], [True], ['10'], [[1], [2]], {'wrong': [1]}, [-1]):
+            with self.subTest(invalid=invalid), self.assertRaises(TypeError):
+                normalize_input_ids(invalid)
+
+    def test_chat_render_then_encode(self):
+        class Encoding:
+            ids = [10, 20]
+        class Tokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                assert kwargs['tokenize'] is False
+                assert kwargs['enable_thinking'] is False
+                return '<chat>task</chat>'
+            def __call__(self, text, **kwargs):
+                assert text == '<chat>task</chat>'
+                assert kwargs['add_special_tokens'] is False
+                return {'input_ids': [Encoding()]}
+        self.assertEqual(chat_input_ids(Tokenizer(), [{'role': 'user', 'content': 'task'}]), [10, 20])
+
+    def test_dtype_version_compatibility(self):
+        self.assertEqual(model_dtype_kwargs('4.51.3', 'bf16'), {'torch_dtype': 'bf16'})
+        self.assertEqual(model_dtype_kwargs('4.56.0', 'bf16'), {'dtype': 'bf16'})
+        self.assertEqual(model_dtype_kwargs('5.0.0.dev0', 'bf16'), {'dtype': 'bf16'})
+
     def test_old_appworld_constructor(self):
         class OldWorld:
             def __init__(self, task_id, experiment_name, max_interactions=100,

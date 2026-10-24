@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections.abc import Mapping
 import ipaddress
 import json
 import os
+from numbers import Integral
 from pathlib import Path
 import queue
 import re
@@ -13,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
@@ -22,6 +25,45 @@ HERE = Path(__file__).resolve().parent
 
 class ContextLimit(RuntimeError):
     pass
+
+
+def normalize_input_ids(encoded):
+    """Extract one integer token sequence from HF or native Tokenizers output."""
+    if isinstance(encoded, Mapping):
+        if 'input_ids' not in encoded:
+            raise TypeError('Tokenizer mapping has no input_ids')
+        encoded = encoded['input_ids']
+    if hasattr(encoded, 'ids'):
+        encoded = encoded.ids
+    elif hasattr(encoded, 'tolist'):
+        encoded = encoded.tolist()
+    # A tokenizer may return a single-element batch containing an Encoding.
+    if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
+        first = encoded[0]
+        if hasattr(first, 'ids') or isinstance(first, (list, tuple)) or hasattr(first, 'tolist'):
+            return normalize_input_ids(first)
+    if not isinstance(encoded, (list, tuple)) or not encoded:
+        raise TypeError(f'Expected a nonempty token ID sequence, got {type(encoded).__name__}')
+    if any(isinstance(x, bool) or not isinstance(x, Integral) or x < 0 for x in encoded):
+        raise TypeError('Tokenizer must return exactly one sequence of nonnegative integer token IDs')
+    return [int(x) for x in encoded]
+
+
+def chat_input_ids(tokenizer, messages):
+    # Render then encode explicitly: apply_chat_template(tokenize=True) has
+    # returned different container types across Transformers versions.
+    text = tokenizer.apply_chat_template(messages, tokenize=False,
+        add_generation_prompt=True, enable_thinking=False)
+    if not isinstance(text, str):
+        raise TypeError(f'Expected rendered chat text, got {type(text).__name__}')
+    encoded = tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+    return normalize_input_ids(encoded)
+
+
+def model_dtype_kwargs(version, dtype):
+    match = re.match(r'(\d+)\.(\d+)', version)
+    modern = match and tuple(map(int, match.groups())) >= (4, 56)
+    return {'dtype' if modern else 'torch_dtype': dtype}
 
 
 def prompt_messages(supervisor, instruction):
@@ -106,6 +148,7 @@ class WorldProcess:
 class TransformersBackend:
     def __init__(self, args):
         import torch
+        import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model = Path(args.model).expanduser().resolve()
         if not model.is_dir():
@@ -120,7 +163,10 @@ class TransformersBackend:
             dtype = torch.bfloat16
         self.tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
         self.model = AutoModelForCausalLM.from_pretrained(
-            model, local_files_only=True, torch_dtype=dtype).to(device).eval()
+            model, local_files_only=True,
+            **model_dtype_kwargs(transformers.__version__, dtype)).to(device).eval()
+        print(f'Model runtime: transformers={transformers.__version__}, '
+              f'tokenizer={type(self.tokenizer).__name__}, device={device}', flush=True)
         self.device = device
         limit = getattr(self.model.config, 'max_position_embeddings', args.context_length)
         self.context_length = min(args.context_length, limit)
@@ -128,12 +174,11 @@ class TransformersBackend:
 
     def generate(self, messages):
         t, args = self.tokenizer, self.args
-        ids = t.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-            enable_thinking=False)
+        ids = chat_input_ids(t, messages)
         if len(ids) + args.max_new_tokens > self.context_length:
             raise ContextLimit(f'{len(ids)} prompt + {args.max_new_tokens} reserved output '
                 f'exceeds context limit {self.context_length}; history was not trimmed')
-        inputs = self.torch.tensor([ids], device=self.device)
+        inputs = self.torch.tensor([ids], dtype=self.torch.long, device=self.device)
         options = dict(max_new_tokens=args.max_new_tokens,
             do_sample=args.temperature > 0, pad_token_id=t.eos_token_id)
         if args.temperature > 0:
@@ -234,7 +279,9 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                 passed_checks=evaluation['passed_checks'], total_checks=evaluation['total_checks'])
             record(dict(type='result', **result))
     except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
         result['error'] = f'{type(exc).__name__}: {exc}'
+        result['traceback'] = traceback.format_exc()
         result['termination'] = 'error'
     finally:
         # Normal closure lets AppWorld persist/close its own state before exit.

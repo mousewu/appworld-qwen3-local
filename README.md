@@ -41,6 +41,8 @@ python run_agent.py \
 
 模型目录必须已经完整下载，模型与 tokenizer 都使用 `local_files_only=True`，不会自动从网络拉权重。Qwen3 默认关闭 thinking；使用真实聊天模板和实际输入 token 长度检查上下文。默认贪心解码，每轮最多 1024 个输出 token，最多 50 轮。没有可用 CUDA 时可用 `--device mps` / `cpu`，速度与兼容性需在目标机器确认。
 
+编码流程先 `apply_chat_template(tokenize=False)`，再以 `add_special_tokens=False` 编码，避免重复添加特殊 token；统一将 HF 编码字典、Tokenizers `Encoding`、单元素 batch 转为整数 ID 列表后再构造 LongTensor。较新 Transformers 使用 `dtype`，旧版本保留 `torch_dtype`。运行时打印 Transformers 版本和 tokenizer 类名；错误会保留完整 traceback 便于定位。
+
 BF16/FP16 的 4B 模型权重约 8GB，另需 KV cache 和推理临时内存；优先使用 16–24GB 或更大显存，长历史可继续增加占用。这里是推理，未加载 Critic 或训练优化器。
 
 ## 3. 方式 B：连接本机 vLLM / SGLang
