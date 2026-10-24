@@ -20,5 +20,7 @@ args=(
   --appworld-root "$APPWORLD_ROOT"
   --split train
   --all-tasks
+  --concurrency "${CONCURRENCY:-4}"
+  --inference-batch-size "${INFERENCE_BATCH_SIZE:-4}"
 )
 exec "$LLM_PYTHON" "$(dirname "$0")/run_agent.py" "${args[@]}" "$@"

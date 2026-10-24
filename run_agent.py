@@ -5,6 +5,7 @@ import argparse
 import ast
 from collections import Counter
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import ipaddress
 import json
@@ -21,6 +22,8 @@ import traceback
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 import uuid
+
+from inference_batching import BatchingBackend
 
 HERE = Path(__file__).resolve().parent
 
@@ -147,13 +150,21 @@ def build_summary(results, planned):
         completed=n == planned)
 
 
-def save_results(out, results, planned):
+def save_results(out, results, planned, wall_seconds=None, inference=None):
     summary = build_summary(results, planned)
+    if wall_seconds is not None:
+        summary['wall_seconds'] = wall_seconds
+        summary['episodes_per_minute'] = len(results) * 60 / wall_seconds if wall_seconds else 0.
+        summary['completion_tokens_per_second'] = (
+            sum(r.get('completion_tokens', 0) for r in results)/wall_seconds if wall_seconds else 0.)
+    if inference is not None:
+        summary['inference'] = inference
     temp = out / 'summary.json.tmp'
     temp.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + '\n')
     temp.replace(out / 'summary.json')
     fields = ['task_id', 'success', 'evaluated', 'declared_done', 'termination', 'steps',
               'executed_steps', 'format_errors', 'execution_errors', 'authentication_errors',
+              'completion_tokens', 'model_wait_seconds', 'environment_seconds',
               'passed_checks', 'total_checks', 'seconds', 'error']
     with (out / 'results.csv.tmp').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
@@ -239,25 +250,60 @@ class TransformersBackend:
         torch.manual_seed(args.seed)
 
     def generate(self, messages):
+        result = self.generate_batch([messages])[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def generate_batch(self, histories):
+        results = [None] * len(histories)
+        valid = []
+        for index, messages in enumerate(histories):
+            try:
+                ids = chat_input_ids(self.tokenizer, messages)
+                if len(ids) + self.args.max_new_tokens > self.context_length:
+                    raise ContextLimit(f'{len(ids)} prompt + {self.args.max_new_tokens} reserved output '
+                        f'exceeds context limit {self.context_length}; history was not trimmed')
+                valid.append((index, ids))
+            except Exception as exc:
+                results[index] = exc
+        if not valid:
+            return results
         t, args = self.tokenizer, self.args
-        ids = chat_input_ids(t, messages)
-        if len(ids) + args.max_new_tokens > self.context_length:
-            raise ContextLimit(f'{len(ids)} prompt + {args.max_new_tokens} reserved output '
-                f'exceeds context limit {self.context_length}; history was not trimmed')
-        inputs = self.torch.tensor([ids], dtype=self.torch.long, device=self.device)
+        width = max(len(ids) for _, ids in valid)
+        eos = self.model.generation_config.eos_token_id
+        if eos is None:
+            eos = t.eos_token_id
+        eos_ids = set(eos if isinstance(eos, (tuple, list)) else [eos]) - {None}
+        pad = t.pad_token_id if t.pad_token_id is not None else t.eos_token_id
+        if pad is None:
+            raise ValueError('Tokenizer needs a pad or EOS token for batched generation')
+        inputs = self.torch.tensor([[pad] * (width-len(ids)) + ids for _, ids in valid],
+            dtype=self.torch.long, device=self.device)
+        mask = self.torch.tensor([[0] * (width-len(ids)) + [1] * len(ids) for _, ids in valid],
+            dtype=self.torch.long, device=self.device)
         options = dict(max_new_tokens=args.max_new_tokens,
-            do_sample=args.temperature > 0, pad_token_id=t.eos_token_id)
+            do_sample=args.temperature > 0, pad_token_id=pad)
         if args.temperature > 0:
             options.update(temperature=args.temperature, top_p=args.top_p, top_k=0)
         with self.torch.inference_mode():
             output = self.model.generate(input_ids=inputs,
-                attention_mask=self.torch.ones_like(inputs), **options)
-        completion = output[0, len(ids):].tolist()
-        return t.decode(completion, skip_special_tokens=True), {
-            'prompt_token_ids': ids, 'completion_token_ids': completion,
-            'prompt_tokens': len(ids), 'completion_tokens': len(completion),
-            'output_limit_reached': len(completion) >= args.max_new_tokens,
-        }
+                attention_mask=mask, **options)
+        completions = output[:, width:].tolist()
+        for (index, ids), completion in zip(valid, completions):
+            ended = False
+            for pos, token in enumerate(completion):
+                if token in eos_ids:
+                    completion = completion[:pos+1]
+                    ended = True
+                    break
+            results[index] = (t.decode(completion, skip_special_tokens=True), {
+                'prompt_token_ids': ids, 'completion_token_ids': completion,
+                'prompt_tokens': len(ids), 'completion_tokens': len(completion),
+                'inference_batch_size': len(valid),
+                'output_limit_reached': not ended and len(completion) >= args.max_new_tokens,
+            })
+        return results
 
 
 class LocalAPIBackend:
@@ -292,14 +338,16 @@ class LocalAPIBackend:
 
 
 def run_episode(args, backend, task_id, run_name, out_dir):
-    worker = WorldProcess(args.appworld_python, args.appworld_root, args.env_timeout)
+    worker = None
     result = dict(task_id=task_id, experiment_name=run_name,
         success=False, evaluated=False, declared_done=False, steps=0,
         executed_steps=0, format_errors=0, execution_errors=0, authentication_errors=0,
+        completion_tokens=0, model_wait_seconds=0., environment_seconds=0.,
         termination='error', error=None)
     path = out_dir / f'{task_id}.jsonl'
     started = time.monotonic()
     try:
+        worker = WorldProcess(args.appworld_python, args.appworld_root, args.env_timeout)
         task = worker.call('reset', task_id=task_id, experiment_name=run_name,
             max_interactions=args.max_steps, seed=args.seed)
         messages = prompt_messages(task['supervisor'], task['instruction'])
@@ -310,10 +358,14 @@ def run_episode(args, backend, task_id, run_name, out_dir):
             record(dict(type='initial', task=task, messages=messages))
             for step in range(1, args.max_steps + 1):
                 try:
+                    generate_started = time.monotonic()
                     raw, generation = backend.generate(messages)
                 except ContextLimit as exc:
                     result.update(termination='context_limit', error=str(exc))
                     break
+                result['model_wait_seconds'] += time.monotonic() - generate_started
+                result['completion_tokens'] += generation.get('completion_tokens',
+                    (generation.get('usage') or {}).get('completion_tokens', 0))
                 messages.append(dict(role='assistant', content=raw))
                 try:
                     code = extract_code(raw)
@@ -325,7 +377,9 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                     feedback_kind = 'format_error'
                     declared_done = False
                 else:
+                    execute_started = time.monotonic()
                     execution = worker.call('execute', code=code)
+                    result['environment_seconds'] += time.monotonic() - execute_started
                     result['executed_steps'] += 1
                     raw_observation = execution['observation']
                     observation, execution_failed = execution_feedback(raw_observation)
@@ -360,12 +414,13 @@ def run_episode(args, backend, task_id, run_name, out_dir):
         result['termination'] = 'error'
     finally:
         # Normal closure lets AppWorld persist/close its own state before exit.
-        if worker.proc.poll() is None:
+        if worker is not None and worker.proc.poll() is None:
             try:
                 worker.call('close')
             except Exception:
                 pass
-        worker.close()
+        if worker is not None:
+            worker.close()
     result['seconds'] = round(time.monotonic() - started, 3)
     # Write terminal status even when a model/worker error interrupts the loop.
     with path.open('a') as stream:
@@ -398,6 +453,12 @@ def parse_args():
     p.add_argument('--model-timeout', type=float, default=300)
     p.add_argument('--output-dir', type=Path, default=HERE / 'runs')
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--concurrency', type=int, default=1,
+        help='Independent task/World subprocesses in flight; model is loaded once')
+    p.add_argument('--inference-batch-size', type=int, default=4,
+        help='Maximum Transformers microbatch size across concurrent tasks')
+    p.add_argument('--batch-wait-ms', type=float, default=20,
+        help='Maximum inference queue collection delay in milliseconds')
     p.add_argument('--check-env', action='store_true',
         help='Reset one task, execute a smoke check, evaluate and exit without loading the LLM')
     a = p.parse_args()
@@ -407,7 +468,8 @@ def parse_args():
         p.error('--model is required for Transformers')
     if min(a.max_steps, a.max_new_tokens, a.context_length, a.env_timeout, a.model_timeout) <= 0:
         p.error('Budgets and timeouts must be positive')
-    if a.limit < 0 or a.temperature < 0 or not 0 < a.top_p <= 1:
+    if (a.limit < 0 or a.temperature < 0 or not 0 < a.top_p <= 1
+            or a.concurrency < 1 or a.inference_batch_size < 1 or a.batch_wait_ms < 0):
         p.error('Invalid limit or sampling parameters')
     a.appworld_root = a.appworld_root.expanduser().resolve()
     if not a.appworld_root.is_dir():
@@ -450,18 +512,32 @@ def main():
     (out / 'config.json').write_text(json.dumps(dict(config=config, tasks=tasks,
         upstream=json.loads((HERE / 'upstream.json').read_text())), indent=2) + '\n')
     backend = TransformersBackend(args) if args.backend == 'transformers' else LocalAPIBackend(args)
+    if args.backend == 'transformers' and args.concurrency > 1:
+        backend = BatchingBackend(backend, args.inference_batch_size, args.batch_wait_ms)
     results = []
     save_results(out, results, len(tasks))
-    for index, task in enumerate(tasks, 1):
-        print(f'\n=== Task {index}/{len(tasks)}: {task} ===', flush=True)
-        result = run_episode(args, backend, task, run_name, out)
-        results.append(result)
-        print(json.dumps(result, ensure_ascii=False), flush=True)
-        summary = save_results(out, results, len(tasks))
-        print(f'Progress {index}/{len(tasks)} | success {summary["successes"]}/{index} '
-              f'({summary["success_rate"]:.1%}) | format errors {summary["format_errors"]} '
-              f'| execution errors {summary["execution_errors"]} '
-              f'| run errors {summary["errors"]}', flush=True)
+    started = time.monotonic()
+    order = {task: index for index, task in enumerate(tasks)}
+    print(f'Evaluating {len(tasks)} tasks, concurrency={args.concurrency}; model loaded once', flush=True)
+    try:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            futures = [pool.submit(run_episode, args, backend, task, run_name, out) for task in tasks]
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                results.sort(key=lambda row: order[row['task_id']])
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                metrics = backend.metrics() if isinstance(backend, BatchingBackend) else None
+                summary = save_results(out, results, len(tasks), time.monotonic()-started, metrics)
+                index = len(results)
+                print(f'Progress {index}/{len(tasks)} | success {summary["successes"]}/{index} '
+                      f'({summary["success_rate"]:.1%}) | episodes/min {summary["episodes_per_minute"]:.2f} '
+                      f'| format errors {summary["format_errors"]} '
+                      f'| execution errors {summary["execution_errors"]} '
+                      f'| run errors {summary["errors"]}', flush=True)
+    finally:
+        if isinstance(backend, BatchingBackend):
+            backend.close()
     print(f'Results: {out}')
     return 1 if any(r['termination'] == 'error' for r in results) else 0
 

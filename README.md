@@ -85,9 +85,30 @@ bash run_train_all.sh
 bash run_train_all.sh --verbose
 ```
 
-脚本中的默认路径匹配当前服务器；其他机器可通过 `LLM_PYTHON`、`MODEL_PATH`、`APPWORLD_PYTHON`、`APPWORLD_ROOT` 环境变量覆盖。它使用 `--split train --all-tasks`，加载实际任务清单并逐一运行，**不抽样、不重复任务**。官方原始 Train 约 105 个任务，不会把重复执行算成 500 个独立任务。
+脚本中的默认路径匹配当前服务器；其他机器可通过 `LLM_PYTHON`、`MODEL_PATH`、`APPWORLD_PYTHON`、`APPWORLD_ROOT` 环境变量覆盖。它使用 `--split train --all-tasks`，加载实际任务清单，**不抽样、不重复任务**。官方原始 Train 约 105 个任务，不会把重复执行算成 500 个独立任务。
 
 任一接入模式均支持 `--all-tasks`，与 `--limit` 互斥；旧的 `--limit 0` 也继续有效。模型权重只加载一次，各任务使用独立 AppWorld 子进程。运行中每个任务完成后保存统计，普通单任务异常记录后继续下一个任务；不支持从中断位置自动续跑。
+
+### GPU 利用率与并发
+
+`run_train_all.sh` 默认 **4 个任务并发、最大推理 batch=4**。主进程的线程只调度 episode；真正的 AppWorld 在各自子进程中运行，一进程一个 world，不在同一进程共享世界状态。模型只加载一份，Transformers 推理由单独的调度线程统一合批，不启动四份模型。
+
+```bash
+# 默认 4 路，先测这一档
+bash run_train_all.sh
+# 显存充足时尝试 8 个任务、最大 batch=8
+CONCURRENCY=8 INFERENCE_BATCH_SIZE=8 bash run_train_all.sh
+# 显存不足/需要串行对照
+CONCURRENCY=1 INFERENCE_BATCH_SIZE=1 bash run_train_all.sh
+```
+
+手动运行支持 `--concurrency 4 --inference-batch-size 4 --batch-wait-ms 20`。命令行单独运行仍默认 concurrency=1，启动脚本才默认 4。调度器最多等待 20ms 收集已就绪的推理请求，不会为了凑满 batch 长时间阻塞。批量输入左侧 padding，并使用 attention mask；输出剔除批量 padding，原始输入 token 日志不含 padding。单条上下文超限不影响其他请求；显存 OOM 会记录当前受影响任务的错误，不自动降低配置重试。
+
+Transformers 是普通微批处理，同一批会等待最长输出结束，不具备 vLLM 的连续批处理。更高吞吐可使用本机 vLLM/SGLang 服务，加 `--backend api --concurrency 8`；客户端并发请求，合批由服务完成，`--inference-batch-size` 不作用于 API 模式。
+
+新增汇总：`wall_seconds`（从评测开始计算，不包含模型加载）、`episodes_per_minute`、`completion_tokens_per_second`（包含环境等待的端到端吞吐）。Transformers 并发还记录 `inference.average_batch_size/max_batch_size/batches/service_seconds`。原 `seconds` 是各 episode 用时之和，并发时不能当成墙钟时间。每任务日志含模型等待时间、执行等待时间及生成 token 数。
+
+先比较 concurrency=1/4/8 的吞吐与显存，不以 GPU 百分比作为唯一目标。长上下文批量会明显增加 KV cache 和 padding 成本，4 路也不保证适合所有 GPU；OOM 时降低并发和推理 batch。采样模式的随机数消耗顺序会随调度改变；即便贪心解码，批处理浮点差异也可能改变结果，因此比较模型成绩时固定并发、后端和采样配置。并发下不要开启大量 verbose 控制台输出，以免日志阻塞。
 
 ### 反馈与统计
 
@@ -108,7 +129,7 @@ python run_agent.py --model /path/to/Qwen3-4B \
   --task-id YOUR_TRAIN_TASK_ID --verbose
 ```
 
-`--limit 0` 跑全部选中任务；默认只跑 1 个 train 任务。`--temperature 0.7 --top-p 0.8` 开启采样。每次运行使用唯一 experiment 名，避免重复 task 覆盖 AppWorld 输出。任务按顺序执行，每个任务一个独立子进程。
+`--limit 0` 跑全部选中任务；默认只跑 1 个 train 任务。`--temperature 0.7 --top-p 0.8` 开启采样。每次运行使用唯一 experiment 名，避免重复 task 覆盖 AppWorld 输出。任务按配置并发执行，每个任务一个独立子进程；汇总按原始任务顺序排列。
 
 结果写到 `runs/qwen3_local_<time>_<id>/`：
 

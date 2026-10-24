@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 import contextlib
 import io
@@ -13,7 +14,8 @@ from types import SimpleNamespace
 from run_agent import (WorldProcess, extract_code, prompt_messages,
                        run_episode, LocalAPIBackend, ContextLimit,
                        normalize_input_ids, chat_input_ids, model_dtype_kwargs,
-                       build_summary, main)
+                       build_summary, main, TransformersBackend)
+from inference_batching import BatchingBackend
 from world_worker import world_kwargs
 
 
@@ -42,6 +44,58 @@ class AppWorld:
 
 
 class AgentTests(unittest.TestCase):
+    def test_batcher_combines_requests_and_isolates_errors(self):
+        from concurrent.futures import ThreadPoolExecutor
+        class Backend:
+            def generate_batch(self, requests):
+                return [ContextLimit('long') if request == 'long' else (request, {}) for request in requests]
+        batcher = BatchingBackend(Backend(), max_batch_size=3, wait_ms=100)
+        try:
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [pool.submit(batcher.generate, item) for item in ['a', 'long', 'b']]
+                self.assertEqual(futures[0].result(timeout=5)[0], 'a')
+                with self.assertRaises(ContextLimit):
+                    futures[1].result(timeout=5)
+                self.assertEqual(futures[2].result(timeout=5)[0], 'b')
+            self.assertEqual(batcher.metrics()['max_batch_size'], 3)
+            self.assertEqual(batcher.metrics()['requests'], 3)
+        finally:
+            batcher.close()
+
+    def test_transformers_batch_padding_and_eos(self):
+        class Tensor:
+            def __init__(self, rows): self.rows = rows
+            def __getitem__(self, indices):
+                _, columns = indices
+                return Tensor([row[columns] for row in self.rows])
+            def tolist(self): return self.rows
+        class Tokenizer:
+            eos_token_id = 9
+            pad_token_id = 0
+            def apply_chat_template(self, messages, **kwargs): return messages[0]['content']
+            def __call__(self, text, **kwargs):
+                return {'input_ids': {'short': [1, 2], 'medium': [3, 4, 5], 'long': list(range(10))}[text]}
+            def decode(self, ids, **kwargs): return str(ids)
+        class Model:
+            generation_config = SimpleNamespace(eos_token_id=[9])
+            def generate(self, input_ids, attention_mask, **kwargs):
+                assert input_ids.rows == [[0, 1, 2], [3, 4, 5]]
+                assert attention_mask.rows == [[0, 1, 1], [1, 1, 1]]
+                return Tensor([input_ids.rows[0] + [7, 9, 0], input_ids.rows[1] + [8, 8, 9]])
+        backend = TransformersBackend.__new__(TransformersBackend)
+        backend.args = SimpleNamespace(max_new_tokens=3, temperature=0, top_p=1)
+        backend.context_length = 10
+        backend.device = 'cpu'
+        backend.tokenizer, backend.model = Tokenizer(), Model()
+        backend.torch = SimpleNamespace(long='long', tensor=lambda rows, **kw: Tensor(rows),
+                                        inference_mode=contextlib.nullcontext)
+        results = backend.generate_batch([[{'content': text}] for text in ['short', 'long', 'medium']])
+        self.assertEqual(results[0][1]['prompt_token_ids'], [1, 2])
+        self.assertEqual(results[0][1]['completion_token_ids'], [7, 9])
+        self.assertFalse(results[0][1]['output_limit_reached'])
+        self.assertIsInstance(results[1], ContextLimit)
+        self.assertEqual(results[2][1]['completion_token_ids'], [8, 8, 9])
+
     def test_syntax_retry_is_not_an_api_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,9 +145,12 @@ class AgentTests(unittest.TestCase):
                                       'return ["fake_task_1", "fake_task_2"]')
             (root / 'appworld.py').write_text(fake)
             class Backend:
-                def generate(self, messages): return 'apis.supervisor.complete_task()', {}
+                barrier = threading.Barrier(2)
+                def generate(self, messages):
+                    self.barrier.wait(timeout=10)
+                    return 'apis.supervisor.complete_task()', {}
             argv = ['run_agent.py', '--backend', 'api', '--appworld-root', str(root),
-                    '--all-tasks', '--output-dir', str(root / 'out')]
+                    '--all-tasks', '--concurrency', '2', '--output-dir', str(root / 'out')]
             with patch.dict(os.environ, {'PYTHONPATH': str(root)}), \
                  patch.object(sys, 'argv', argv), \
                  patch('run_agent.LocalAPIBackend', return_value=Backend()), \
