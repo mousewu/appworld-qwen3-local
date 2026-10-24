@@ -100,6 +100,18 @@ Transformers 路径保存 prompt/completion token IDs；API 路径保存服务 u
 
 ## 5. CPU 验证与限制
 
+AppWorld SDK 不同版本的构造参数存在差异。Worker 根据实际签名传入支持的可选参数；不支持的参数不传入，保留该 SDK 默认行为。支持的执行保护选项显式设为 True，不会为兼容而设为 False；不支持的保护选项也不声称已开启。每个任务日志记录 Python、AppWorld 版本、类所在文件及实际参数。
+
+升级代码后，可先不加载模型，只检查环境是否能够初始化、执行和评测：
+
+```bash
+python run_agent.py --check-env \
+  --appworld-python /absolute/path/to/appworld/bin/python \
+  --appworld-root /absolute/path/to/appworld-root
+```
+
+检查会打印 `2` 对应的执行输出和验证状态；它不解决任务，`success=false` 正常。初始化与评测不报异常才代表检查通过。
+
 ```bash
 python -m unittest -v test_agent.py
 python run_agent.py --help

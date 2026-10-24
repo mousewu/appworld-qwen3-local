@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 from run_agent import (WorldProcess, extract_code, prompt_messages,
                        run_episode, LocalAPIBackend, ContextLimit)
+from world_worker import world_kwargs
 
 
 FAKE_WORLD = '''
@@ -37,6 +38,48 @@ class AppWorld:
 
 
 class AgentTests(unittest.TestCase):
+    def test_old_appworld_constructor(self):
+        class OldWorld:
+            def __init__(self, task_id, experiment_name, max_interactions=100,
+                         random_seed=0, raise_on_unsafe_syntax=True):
+                self.syntax_guard = raise_on_unsafe_syntax
+        request = dict(task_id='x', experiment_name='test', max_interactions=50, seed=123)
+        kwargs, skipped = world_kwargs(OldWorld, request)
+        self.assertEqual(skipped, ['raise_on_unsafe_execution'])
+        self.assertNotIn('raise_on_unsafe_execution', kwargs)
+        self.assertTrue(OldWorld(**kwargs).syntax_guard)
+
+    def test_new_appworld_constructor(self):
+        class NewWorld:
+            def __init__(self, task_id, experiment_name, max_interactions=100,
+                         random_seed=0, raise_on_unsafe_syntax=True,
+                         raise_on_unsafe_execution=True):
+                self.execution_guard = raise_on_unsafe_execution
+        kwargs, skipped = world_kwargs(NewWorld, dict(task_id='x', experiment_name='test',
+            max_interactions=50, seed=123))
+        self.assertEqual(skipped, [])
+        self.assertTrue(NewWorld(**kwargs).execution_guard)
+
+    def test_old_sdk_process(self):
+        old_fake = FAKE_WORLD.replace('def __init__(self, **kwargs):',
+            'def __init__(self, task_id, experiment_name, max_interactions=100, '
+            'random_seed=0, raise_on_unsafe_syntax=True):')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'appworld.py').write_text(old_fake)
+            with patch.dict(os.environ, {'PYTHONPATH': str(root)}):
+                worker = WorldProcess(sys.executable, root, 10)
+                try:
+                    task = worker.call('reset', task_id='x', experiment_name='test',
+                                       max_interactions=50, seed=123)
+                    self.assertEqual(task['runtime']['skipped_optional_kwargs'],
+                                     ['raise_on_unsafe_execution'])
+                    self.assertEqual(worker.call('execute', code='print(1)')['observation'], '2')
+                    self.assertFalse(worker.call('evaluate')['success'])
+                    worker.call('close')
+                finally:
+                    worker.close()
+
     def test_code_parser(self):
         self.assertEqual(extract_code('```python\nprint(1)\n```'), 'print(1)')
         self.assertEqual(extract_code('<code>print(2)</code>'), 'print(2)')

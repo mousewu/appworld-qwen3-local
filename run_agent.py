@@ -271,8 +271,10 @@ def parse_args():
     p.add_argument('--model-timeout', type=float, default=300)
     p.add_argument('--output-dir', type=Path, default=HERE / 'runs')
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--check-env', action='store_true',
+        help='Reset one task, execute a smoke check, evaluate and exit without loading the LLM')
     a = p.parse_args()
-    if a.backend == 'transformers' and not a.model:
+    if a.backend == 'transformers' and not a.model and not a.check_env:
         p.error('--model is required for Transformers')
     if min(a.max_steps, a.max_new_tokens, a.context_length, a.env_timeout, a.model_timeout) <= 0:
         p.error('Budgets and timeouts must be positive')
@@ -297,6 +299,20 @@ def main():
     tasks = tasks[:args.limit] if args.limit else tasks
     if not tasks:
         raise ValueError('No tasks selected')
+    if args.check_env:
+        worker = WorldProcess(args.appworld_python, args.appworld_root, args.env_timeout)
+        try:
+            task = worker.call('reset', task_id=tasks[0],
+                experiment_name=f'qwen3_env_check/{uuid.uuid4().hex}',
+                max_interactions=args.max_steps, seed=args.seed)
+            execution = worker.call('execute', code='print(1 + 1)')
+            evaluation = worker.call('evaluate')
+            print(json.dumps(dict(runtime=task['runtime'], execution=execution,
+                evaluation=evaluation), indent=2, ensure_ascii=False))
+            worker.call('close')
+        finally:
+            worker.close()
+        return 0
     run_name = f'qwen3_local/{time.strftime("%Y%m%d_%H%M%S")}_{uuid.uuid4().hex[:8]}'
     out = args.output_dir.expanduser().resolve() / run_name.replace('/', '_')
     out.mkdir(parents=True, exist_ok=False)
