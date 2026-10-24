@@ -262,3 +262,52 @@ trajectories as SFT targets. Do not randomly split individual turns: if holding 
 Train data, group all three variants of a scenario together. Training loss alone is
 not a measure of task success. Local validation here covers mocks and conversion/masking
 logic; real official bundle replay and CUDA training must be verified on your server.
+
+## Full-parameter SFT
+
+`train_full.py` shares the LoRA pipeline's tokenization, prompt format, completion-only
+loss masking, collator, and overlength filtering. It makes **all model parameters
+trainable**, uses no PEFT adapter, and saves a standalone model directly. Defaults:
+BF16, gradient checkpointing, learning rate `1e-5`, one epoch, cosine schedule,
+3% warmup, weight decay 0.01, gradient clipping 1.0 (Trainer default).
+
+```bash
+# Same LLM environment and converted dataset as LoRA
+/opt/conda/bin/python -m pip install -r requirements-sft.txt
+bash run_sft_full.sh
+```
+
+The default output is `sft_outputs/qwen3_4b_full`; use this directory as `--model`
+with `run_agent.py`, or as `MODEL_PATH` with the evaluation shell script. There is
+no merge step. Choose an empty output directory for each new run.
+
+For multi-GPU DDP (model and optimizer replicated per GPU):
+
+```bash
+NPROC_PER_NODE=2 GRAD_ACCUM=8 bash run_sft_full.sh
+```
+
+Effective batch size is `BATCH_SIZE × GRAD_ACCUM × NPROC_PER_NODE`. Thus the example
+above keeps the default effective batch of 16. For sharded training, install DeepSpeed
+in the LLM environment and enable the included ZeRO-3 configuration:
+
+```bash
+/opt/conda/bin/python -m pip install deepspeed
+NPROC_PER_NODE=2 GRAD_ACCUM=8 DEEPSPEED_CONFIG=configs/zero3.json bash run_sft_full.sh
+```
+
+ZeRO-3 partitions parameters, gradients, and optimizer states; this config does not
+CPU-offload. Final model saving gathers weights, so allow memory headroom. DeepSpeed
+requires a CUDA/toolchain-compatible installation. This is a single-node launcher;
+DDP alone does not reduce per-GPU model/optimizer memory.
+
+Full tuning consumes substantially more memory than LoRA. For 4B, BF16 weights and
+BF16 gradients alone are about 16 GB combined; optimizer state, activations and save
+buffers add more. Start on an 80 GB GPU or use multi-GPU ZeRO-3, then measure peak
+memory on your actual lengths. A 24 GB GPU is not a supported expectation for this
+full-training configuration. Override `MAX_LENGTH=4096` to reduce activations; skipped
+sample counts are recorded. `LEARNING_RATE`, `EPOCHS`, `BATCH_SIZE`, `GRAD_ACCUM`,
+`OUTPUT_DIR`, and the existing model/data path environment variables are configurable.
+Extra CLI flags (e.g. `--warmup-ratio 0.05`) can be appended to the shell command.
+Start with a small learning rate and compare Dev task success with the LoRA baseline.
+Real CUDA/DDP/ZeRO-3 training has not been validated on the development machine.

@@ -4,7 +4,7 @@ import tempfile
 from unittest.mock import patch
 from pathlib import Path
 from convert_official_sft import convert_task
-from train_lora import encode_sample
+from train_lora import encode_sample, configure_model
 
 
 class Worker:
@@ -37,6 +37,18 @@ class Tokenizer:
 
 
 class SFTTests(unittest.TestCase):
+    def test_full_mode_unfreezes_original_model_without_adapter(self):
+        class Model:
+            def __init__(self):
+                self.flags = [False, False, True]
+
+            def requires_grad_(self, enabled):
+                self.flags = [enabled] * len(self.flags)
+        model = Model()
+        result = configure_model(model, 'full', 16)
+        self.assertIs(result, model)
+        self.assertEqual(result.flags, [True, True, True])
+
     def test_cli_train_whitelist_and_audit(self):
         import convert_official_sft as converter
         class CLIWorker(Worker):
