@@ -218,3 +218,75 @@ and leaves no training JSONL. The additional normal length statistics reuse the 
 encoding pass. Only anomaly messages are individually re-encoded for localization.
 A tokenizer warning before filtering can still appear for million-token input; these
 examples are measured and then skipped, never sent to the training model by preparation.
+
+## Build complete_8k / complete_16k / complete_32k
+
+Use the **original replay-verified `train.jsonl`**, not the per-sample filtered Slime
+JSONL. This preserves the denominator and lets the script reject whole trajectories.
+
+```bash
+python build_complete_sft.py \
+  --model /home/notebook/data/group/LLMs_data/Qwen3-4B-Instruct-2507 \
+  --data sft_data/official_gpt4o_v011/train.jsonl \
+  --diagnostics-stats sft_data/official_gpt4o_v011/slime_train_diagnosed.stats.json \
+  --output-dir sft_data/complete_versions
+```
+
+The optional `--diagnostics-stats` reuses the sibling `.lengths.csv`. It checks the
+original input SHA256, tokenizer signature, task IDs, steps and line coverage.
+Selected samples are re-tokenized and checked against cached lengths; excluded
+million-token histories need not be tokenized again. Without this option, the first
+pass measures every input sample. Use the same local tokenizer/model files as in
+preprocessing. A cache mismatch aborts rather than silently using stale statistics.
+
+Whole-task rules, applied independently at inclusive limits 8192, 16384 and 32768:
+
+1. Any sample with total tokens **>= 1,000,000** excludes its task from all versions
+   (configurable using `--anomaly-threshold`). Even early short samples are removed.
+2. Steps must start at 1 and be contiguous without duplicates. Each later history
+   must contain exactly the prior history, prior target assistant code and one user
+   observation. Missing/mixed histories reject the whole task.
+3. The final target code must contain an AST `apis.supervisor.complete_task(...)`
+   call. This checks for an available ending, not runtime success; the input is
+   required to come from the success-replay converter. Aliased calls are not resolved.
+4. **Every** sample of the task must fit the version's length limit. No sample or
+   observation is dropped, truncated or compressed to make a trajectory fit.
+
+The task sets are nested: complete_8k is a subset of complete_16k, which is a subset
+of complete_32k. The output directory must not already exist. Conversion stages all
+files and publishes the directory only after successful completion.
+
+```text
+complete_versions/
+  summary.json           # versions, task IDs, source/model signatures, anomaly task locations
+  summary.csv            # tasks/samples/complete_task sample and call counts/supervised tokens
+  task_audit.csv         # every task's retained/rejected status and reasons, per version
+  complete_8k/
+    train.jsonl          # unchanged source examples, full retained trajectories
+    slime_train.jsonl    # tokens + final-completion-only mask metadata, ready for Slime
+    stats.json
+  complete_16k/          # same three files
+  complete_32k/          # same three files
+```
+
+`complete_task_calls` counts syntactic calls in target code, `complete_task_samples`
+counts examples containing them; neither counts historical/few-shot calls. A version
+can be empty; its files and zero-count report are still generated, and it cannot be
+used for training. Counts are measured from your actual data, not hardcoded to 26/47.
+The script does not independently re-evaluate task success or prove that the final
+call executed. Do not use arbitrary incomplete/failed rollout logs as input.
+
+For example, train the 16K version directly without another preparation pass:
+
+```bash
+MAX_LENGTH=16384 \
+DATA_PATH="$PWD/sft_data/complete_versions/complete_16k/slime_train.jsonl" \
+OUTPUT_DIR="$PWD/sft_outputs/qwen3_4b_complete_16k" \
+NUM_GPUS=2 TP_SIZE=2 GLOBAL_BATCH_SIZE=16 \
+bash run_sft_full.sh
+```
+
+Use 8192/32768 and the corresponding directory for the other versions. Compare the
+three `summary.csv` rows before allocating longer-context training; longer sequences
+can require more GPU memory. Keep all variants of a task/scenario together if you
+subsequently construct a holdout; these versions are training subsets, not new splits.
