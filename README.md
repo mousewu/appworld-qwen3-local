@@ -1,3 +1,6 @@
+> **SFT 当前入口已切换到 Slime 全参训练：见 [SLIME_SFT.md](SLIME_SFT.md)。**
+> 下方 HF Trainer/LoRA 章节保留作历史替代方案。官方 0.1.1 输出包的 Train 目录为 `react_gpt4o_train`；旧版默认下载命令可能拿不到 Train 轨迹。
+
 # 本地 Qwen3-4B 运行 AppWorld
 
 基于 [AppWorld 官方 minimal_agent.ipynb](https://github.com/StonyBrookNLP/appworld/blob/main/notebooks/minimal_agent.ipynb) 实现的命令行 ReAct Agent。无需 Docker、真实 App 账户或云端模型 API。
@@ -215,7 +218,7 @@ Run from this repository, with Jinja2 installed in the launcher Python:
   --output-dir sft_data/official_gpt4o
 ```
 
-Default experiment: `simplified_react_code_agent_gpt-4o-2024-05-13_train`.
+Default experiment: `react_gpt4o_train`.
 Use `--experiment` only for another official **Train** experiment directory.
 Replay outputs use a unique `sft_replay/...` experiment; original logs are read-only.
 The output directory must be empty. Outputs:
@@ -274,7 +277,7 @@ BF16, gradient checkpointing, learning rate `1e-5`, one epoch, cosine schedule,
 ```bash
 # Same LLM environment and converted dataset as LoRA
 /opt/conda/bin/python -m pip install -r requirements-sft.txt
-bash run_sft_full.sh
+bash run_sft_full_hf.sh
 ```
 
 The default output is `sft_outputs/qwen3_4b_full`; use this directory as `--model`
@@ -284,7 +287,7 @@ no merge step. Choose an empty output directory for each new run.
 For multi-GPU DDP (model and optimizer replicated per GPU):
 
 ```bash
-NPROC_PER_NODE=2 GRAD_ACCUM=8 bash run_sft_full.sh
+NPROC_PER_NODE=2 GRAD_ACCUM=8 bash run_sft_full_hf.sh
 ```
 
 Effective batch size is `BATCH_SIZE × GRAD_ACCUM × NPROC_PER_NODE`. Thus the example
@@ -293,7 +296,7 @@ in the LLM environment and enable the included ZeRO-3 configuration:
 
 ```bash
 /opt/conda/bin/python -m pip install deepspeed
-NPROC_PER_NODE=2 GRAD_ACCUM=8 DEEPSPEED_CONFIG=configs/zero3.json bash run_sft_full.sh
+NPROC_PER_NODE=2 GRAD_ACCUM=8 DEEPSPEED_CONFIG=configs/zero3.json bash run_sft_full_hf.sh
 ```
 
 ZeRO-3 partitions parameters, gradients, and optimizer states; this config does not

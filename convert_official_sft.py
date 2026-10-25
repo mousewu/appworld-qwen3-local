@@ -9,7 +9,7 @@ import uuid
 
 from run_agent import WorldProcess, extract_code, execution_feedback, prompt_messages
 
-DEFAULT_EXPERIMENT = 'simplified_react_code_agent_gpt-4o-2024-05-13_train'
+DEFAULT_EXPERIMENT = 'react_gpt4o_train'
 
 
 def convert_task(worker, task_id, source, experiment, seed):
