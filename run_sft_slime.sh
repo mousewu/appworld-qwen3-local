@@ -2,11 +2,16 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
-: "${SLIME_DIR:?Set SLIME_DIR to the pinned Slime checkout}"
-: "${MEGATRON_DIR:?Set MEGATRON_DIR to your compatible Megatron-LM checkout}"
 SLIME_PYTHON="${SLIME_PYTHON:-python}"
-SLIME_DIR="$(cd "$SLIME_DIR" && pwd)"
-MEGATRON_DIR="$(cd "$MEGATRON_DIR" && pwd)"
+export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+# Source directories are optional when the modules are already installed.
+for source_dir in "${SLIME_DIR:-}" "${MEGATRON_DIR:-}"; do
+  if [[ -n "$source_dir" ]]; then
+    source_dir="$(cd "$source_dir" && pwd)"
+    export PYTHONPATH="$source_dir:$PYTHONPATH"
+  fi
+done
+SLIME_TRAIN_SCRIPT="$("$SLIME_PYTHON" "$PROJECT_DIR/slime_runtime.py")"
 MODEL_PATH="${MODEL_PATH:-/home/notebook/data/group/LLMs_data/Qwen3-4B-Instruct-2507}"
 DATA_PATH="${DATA_PATH:-$PROJECT_DIR/sft_data/official_gpt4o_v011/slime_train.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/sft_outputs/qwen3_4b_slime}"
@@ -14,12 +19,6 @@ NUM_GPUS="${NUM_GPUS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
 MAX_LENGTH="${MAX_LENGTH:-8192}"
-REVISION=18868a79b0b083a093798a94ed0f8cb4f71b9c14
-if [[ "$(git -C "$SLIME_DIR" rev-parse HEAD)" != "$REVISION" ]]; then
-  echo "Slime checkout must be at $REVISION; see SLIME_SFT.md" >&2
-  exit 1
-fi
-export PYTHONPATH="$PROJECT_DIR:$SLIME_DIR:$MEGATRON_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 # Validate paths and geometry before allocating Ray actors. Read RoPE from the actual model.
@@ -58,11 +57,11 @@ PY
 )"
 read -r MODEL_ARGS_ROTARY_BASE MODEL_MAX_POSITIONS <<< "$MODEL_LIMITS"
 export MODEL_ARGS_ROTARY_BASE
-source "$SLIME_DIR/scripts/models/qwen3-4B.sh"
+source "$PROJECT_DIR/configs/qwen3_4b_slime.sh"
 args=(
   --actor-num-nodes 1 --actor-num-gpus-per-node "$NUM_GPUS"
-  --hf-checkpoint "$MODEL_PATH" --load "$MODEL_PATH"
-  --save "$OUTPUT_DIR/checkpoints" --save-hf "$OUTPUT_DIR/hf"
+  --hf-checkpoint "$MODEL_PATH" --load "${INIT_CHECKPOINT:-$MODEL_PATH}"
+  --save "$OUTPUT_DIR/checkpoints"
   --save-interval "${SAVE_INTERVAL:-100}"
   --rollout-function-path slime_sft.generate_rollout
   --prompt-data "$DATA_PATH" --input-key prompt --metadata-key metadata
@@ -84,7 +83,8 @@ args=(
   --attention-backend flash --accumulate-allreduce-grads-in-fp32
   --attention-softmax-in-fp32
 )
+if [[ "${SAVE_HF:-1}" == "1" ]]; then args+=(--save-hf "$OUTPUT_DIR/hf"); fi
 if (( TP_SIZE > 1 )); then args+=(--sequence-parallel); fi
 # Slime/Ray can initialize a local cluster. No shared Ray/Python processes are killed.
-cd "$SLIME_DIR"
-exec "$SLIME_PYTHON" train.py "${MODEL_ARGS[@]}" "${args[@]}" "$@"
+cd "$(dirname "$SLIME_TRAIN_SCRIPT")"
+exec "$SLIME_PYTHON" "$SLIME_TRAIN_SCRIPT" "${MODEL_ARGS[@]}" "${args[@]}" "$@"

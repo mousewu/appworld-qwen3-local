@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from slime_sft import prepare_row, tokenizer_signature, SLIME_REVISION
+from slime_sft import prepare_row, tokenizer_signature, SFT_ADAPTER_SCHEMA
 from sft_diagnostics import Diagnostics, describe_anomaly
 
 
@@ -71,7 +71,7 @@ def main():
         summary = diagnostics.summary()
         stats = dict(counts=counts, unique_tasks=summary['tasks']['with_retained_samples'],
             max_length=a.max_length, anomaly_threshold=a.anomaly_threshold,
-            tokenizer_signature=signature, slime_revision=SLIME_REVISION,
+            tokenizer_signature=signature, slime_adapter_schema=SFT_ADAPTER_SCHEMA,
             source=str(a.data.resolve()), source_sha256=hashlib.sha256(a.data.read_bytes()).hexdigest(),
             **summary)
         write_csv(a.output.with_suffix('.lengths.csv'), diagnostics.records)
@@ -85,7 +85,7 @@ def main():
             temporary.unlink()
     # Keep the console compact; detailed distributions and top-20 are on disk.
     print(json.dumps({k: stats[k] for k in ['counts', 'unique_tasks', 'max_length',
-        'tokenizer_signature', 'slime_revision', 'source_sha256', 'tasks', 'complete_task']}, indent=2))
+        'tokenizer_signature', 'slime_adapter_schema', 'source_sha256', 'tasks', 'complete_task']}, indent=2))
     print('Diagnostic reports:', ', '.join(str(path) for path in artifacts[1:]))
 
 

@@ -9,24 +9,26 @@ optimizer, backward, gradient reduction and parameter updates are owned by Slime
 
 ## 1. Training environment (separate from AppWorld)
 
-Pin the upstream source/API checked for this implementation:
+No Slime or Megatron version, tag, or Git commit is enforced. Reuse your existing
+training environment. The launcher imports the installed modules and finds Slime's
+`train.py` automatically when the installation points at a source checkout.
 
-```bash
-git clone https://github.com/THUDM/slime.git
-cd slime
-git checkout 18868a79b0b083a093798a94ed0f8cb4f71b9c14
-```
+- `MEGATRON_DIR` is optional. Set it only if Megatron is not already importable.
+- `SLIME_DIR` is optional. Set it if automatic training-entry discovery fails.
+- `SLIME_TRAIN_SCRIPT` can point directly to your existing Slime `train.py`.
+- `SLIME_PYTHON` selects the training environment's Python (defaults to `python`).
 
-Use the compatible Megatron, Transformer Engine, CUDA, PyTorch and Ray stack from this
-checkout's [official setup](https://github.com/THUDM/slime/blob/18868a79b0b083a093798a94ed0f8cb4f71b9c14/docs/en/get_started/quick_start.md).
-A plain `pip install slime` is not the NVIDIA training dependency installation.
-Do **not** install this project's `requirements-sft.txt` into that environment: its
-HF Trainer pins can conflict with Slime. Jinja2 and Transformers must be available.
+Different framework releases can expose different CLI/checkpoint APIs. No version
+comparison or forced upgrade/downgrade runs; the installed framework reports any
+unsupported arguments. Qwen3 architecture arguments are maintained in this project
+at `configs/qwen3_4b_slime.sh`, so an upstream model-script path is not required.
+A plain `pip install slime` is not a complete NVIDIA training-stack installation.
+Do not install this project's old `requirements-sft.txt` into a working Slime stack.
 
 Docker is not required. The upstream non-Docker path is:
 
 ```bash
-# Linux NVIDIA training server; execute from the pinned Slime checkout.
+# Linux NVIDIA training server; execute from your Slime checkout.
 # Upstream build script creates a micromamba environment and compiles dependencies.
 # It also accesses /root/.cargo and modifies shell configuration; inspect it first.
 BASE_DIR=/root SHELL=/bin/bash bash build_conda.sh
@@ -37,7 +39,7 @@ python -c 'import torch, ray, slime, megatron.core, transformer_engine; print(to
 ```
 
 This path requires suitable /root permissions, build tools, network access during setup,
-and a compatible driver. The pinned script defaults its CUDA build architectures to
+and a compatible driver. The upstream build script may default its CUDA build architectures to
 Hopper/Blackwell; adjust the upstream `TORCH_CUDA_ARCH_LIST` for your actual hardware
 and check that its dependency stack supports that GPU. Slime's CUDA requirements are
 separate from AppWorld's CPU-only installation. Existing compatible Slime environments
@@ -99,7 +101,8 @@ From the AppWorld agent repository:
 
 ```bash
 export SLIME_DIR=/root/slime
-export MEGATRON_DIR=/root/Megatron-LM
+# Optional, only when Megatron is not already installed:
+# export MEGATRON_DIR=/root/Megatron-LM
 export SLIME_PYTHON=python  # Python in the activated Slime environment
 
 NUM_GPUS=2 TP_SIZE=2 GLOBAL_BATCH_SIZE=16 bash run_sft_slime.sh
@@ -133,16 +136,14 @@ GPUs can run full tuning. To reduce sequence length, regenerate data with a lowe
 
 Megatron checkpoints are saved under `OUTPUT_DIR/checkpoints`. `--save-hf` writes the
 latest saved standalone HF model under `OUTPUT_DIR/hf`; use that directory as `--model`
-for `run_agent.py`. No PEFT merging or external checkpoint conversion is required for
-the pinned Slime revision. Run Dev evaluation in the existing AppWorld/LLM setup.
+for `run_agent.py`. No PEFT merging or external checkpoint conversion is required when supported by your installed Slime. Run Dev evaluation in the existing AppWorld/LLM setup.
 
 ## Validation boundary
 
 CPU tests check prompt/answer masking, adapter Sample fields, overlength rejection,
 and tokenizer mismatch rejection. CLI help and shell syntax are checked. GPU Megatron
 execution, Ray allocation, checkpoint loading/export and actual official-data replay
-have **not** been run on the development Mac. The upstream pin is an integration
-contract, not a claim of end-to-end GPU validation.
+have **not** been run on the development Mac. Framework versions are not pinned; these tests are not end-to-end GPU validation.
 
 ## Length, task and completion-action diagnostics
 
@@ -290,3 +291,25 @@ Use 8192/32768 and the corresponding directory for the other versions. Compare t
 three `summary.csv` rows before allocating longer-context training; longer sequences
 can require more GPU memory. Keep all variants of a task/scenario together if you
 subsequently construct a holdout; these versions are training subsets, not new splits.
+
+
+### Existing framework environments and checkpoint APIs
+
+The launcher no longer requires `MEGATRON_DIR` or a specific Slime checkout. If the
+modules are already installed, use the same training command without those variables.
+An installation that does not include the top-level `train.py` still needs its path
+via `SLIME_DIR` or `SLIME_TRAIN_SCRIPT`; that is a file-location requirement, not a
+version restriction.
+
+For Slime builds without direct HF checkpoint loading, provide an already converted
+Megatron checkpoint with `INIT_CHECKPOINT=/path/to/torch_dist`. `MODEL_PATH` remains
+the HF model configuration/tokenizer directory. If your build has no `--save-hf`
+option, use `SAVE_HF=0`; it will save Megatron checkpoints only, which must be exported
+with that installation's conversion tool before HF inference. These switches do not
+claim compatibility with every historical/future Slime API. The adapter still requires
+the custom-rollout Sample and native SFT loss interfaces.
+
+Dataset metadata now records `slime_adapter_schema`, not an asserted Slime Git revision.
+Existing tokenized datasets are still usable; the training adapter never checked a
+Slime version or used the old informational `slime_revision` field. Tokenizer signature
+checks remain, since model/tokenizer mismatch changes the meaning of token IDs.

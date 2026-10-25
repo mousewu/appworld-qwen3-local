@@ -9,7 +9,7 @@ import tempfile
 
 from prepare_slime_sft import write_csv
 from sft_diagnostics import complete_task_actions
-from slime_sft import prepare_row, tokenizer_signature, SLIME_REVISION
+from slime_sft import prepare_row, tokenizer_signature, SFT_ADAPTER_SCHEMA
 
 LIMITS = {'complete_8k': 8192, 'complete_16k': 16384, 'complete_32k': 32768}
 
@@ -189,7 +189,7 @@ def main():
         if file_hash(a.data) != source_hash:
             raise ValueError('Source changed during processing')
         summary = dict(source=str(a.data.resolve()), source_sha256=source_hash,
-            tokenizer_signature=signature, slime_revision=SLIME_REVISION,
+            tokenizer_signature=signature, slime_adapter_schema=SFT_ADAPTER_SCHEMA,
             anomaly_threshold=a.anomaly_threshold, input_tasks=len(tasks), input_samples=len(seen),
             excluded_anomaly_tasks=[dict(task_id=tid, max_total_tokens=t['max_total_tokens'],
                 anomalies=t['anomalies']) for tid,t in sorted(tasks.items()) if t['anomalies']],

@@ -3,7 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
-SLIME_REVISION = '18868a79b0b083a093798a94ed0f8cb4f71b9c14'
+SFT_ADAPTER_SCHEMA = 'appworld_completion_v1'
 
 
 def tokenizer_signature(model):
