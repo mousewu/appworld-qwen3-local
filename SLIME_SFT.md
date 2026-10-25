@@ -143,3 +143,78 @@ and tokenizer mismatch rejection. CLI help and shell syntax are checked. GPU Meg
 execution, Ray allocation, checkpoint loading/export and actual official-data replay
 have **not** been run on the development Mac. The upstream pin is an integration
 contract, not a claim of end-to-end GPU validation.
+
+## Length, task and completion-action diagnostics
+
+`prepare_slime_sft.py` now writes four local reports beside the output. Existing output
+or report files are not overwritten; choose a new output basename to rerun:
+
+```bash
+python prepare_slime_sft.py \
+  --model /home/notebook/data/group/LLMs_data/Qwen3-4B-Instruct-2507 \
+  --data sft_data/official_gpt4o_v011/train.jsonl \
+  --output sft_data/official_gpt4o_v011/slime_train_diagnosed.jsonl \
+  --max-length 8192 \
+  --anomaly-threshold 1000000
+```
+
+- `slime_train_diagnosed.stats.json`: total/prompt/completion token distributions for
+  all input and retained samples (min/max/mean, interpolated P50/P75/P90/P95/P99,
+  nonoverlapping length buckets); task coverage; completion-action retention; and
+  the 20 longest samples with source line numbers. All lengths include the actual
+  chat template; prompt includes history, and completion includes its end marker.
+- `slime_train_diagnosed.lengths.csv`: one row per input example with lengths,
+  task ID, step, retained flag, action presence and source line. Use this to compare
+  8K/16K thresholds without conflating sample count with unique tasks.
+- `slime_train_diagnosed.tasks.csv`: input/retained sample and completion-action
+  counts, retention rates, and maximum length for **every input task**, including
+  tasks with no retained samples. A null rate means no applicable denominator.
+- `slime_train_diagnosed.anomalies.jsonl`: every example with total length at least
+  the anomaly threshold. Records task ID, step, source line, source trajectory hash
+  when available, each message's role/character count/independently encoded content
+  token count, five largest messages, and the preceding assistant message index.
+
+The default threshold is one million total tokens and is independent of the 8K/16K
+training cutoff. Repeated long histories can create multiple anomaly rows from the
+same task; anomaly count is not a count of independent root causes. Message token
+counts are diagnostic content-only measurements, not an additive decomposition of
+the full templated sequence. Source lines are one-based; message indices are zero-based.
+
+To inspect a location without dumping a huge history:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+p = Path('sft_data/official_gpt4o_v011/slime_train_diagnosed.anomalies.jsonl')
+for line in p.open():
+    r = json.loads(line)
+    print(r['task_id'], 'step', r['step'], 'source_line', r['source_line'],
+          'total_tokens', r['total_tokens'])
+    for m in r['largest_messages'][:3]:
+        print(' ', m)
+PY
+```
+
+Locate the matching row in the original `train.jsonl`, then use its message index.
+For a large user observation, `preceding_assistant_index` points to the code that
+preceded that observation; this is a debugging clue, not proof of the root cause.
+By default no raw text is copied to diagnostic reports. Optional
+`--diagnostic-preview-chars 160` adds bounded message previews for local inspection.
+These may contain simulated account data; keep derived reports local like the dataset.
+
+Completion actions are detected with Python AST in the **current target code**:
+exact `apis.supervisor.complete_task(...)` calls count, comments and strings do not.
+Historical/few-shot calls do not enter the denominator. Sample retention means target
+samples containing a call kept / such samples read. Call retention counts actual
+syntactic call occurrences, and task retention counts tasks with at least one retained
+action / tasks with at least one input action. Calls with explicit `status="fail"`
+are broken out separately; other/dynamic status values and `**kwargs` are identified.
+Aliases are not resolved, and a syntactic call (e.g. inside an unexecuted branch) is
+not proof it ran or that the task succeeded.
+
+Reports are also saved when all examples are overlength; the command exits nonzero
+and leaves no training JSONL. The additional normal length statistics reuse the main
+encoding pass. Only anomaly messages are individually re-encoded for localization.
+A tokenizer warning before filtering can still appear for million-token input; these
+examples are measured and then skipped, never sent to the training model by preparation.

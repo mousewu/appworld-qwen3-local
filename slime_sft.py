@@ -21,13 +21,13 @@ def tokenizer_signature(model):
     return digest.hexdigest()
 
 
-def prepare_row(tokenizer, row, max_length, signature):
+def prepare_row(tokenizer, row, max_length, signature, diagnostics=None):
     from run_agent import extract_code
     from train_lora import encode_sample
     code = row['completion']
     if extract_code(code) != code.strip():
         raise ValueError('Completion must be raw Python, matching the inference prompt')
-    encoded = encode_sample(tokenizer, row, max_length)
+    encoded = encode_sample(tokenizer, row, max_length, diagnostics=diagnostics)
     if encoded is None:
         return None
     labels = encoded['labels']

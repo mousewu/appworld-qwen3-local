@@ -6,7 +6,7 @@ from pathlib import Path
 from run_agent import chat_input_ids, normalize_input_ids, model_dtype_kwargs
 
 
-def encode_sample(tokenizer, row, max_length):
+def encode_sample(tokenizer, row, max_length, diagnostics=None):
     prefix = chat_input_ids(tokenizer, row['messages'])
     # Render the answer through the same chat template, including end-of-turn.
     full = normalize_input_ids(tokenizer(tokenizer.apply_chat_template(
@@ -15,6 +15,9 @@ def encode_sample(tokenizer, row, max_length):
         add_special_tokens=False, return_attention_mask=False))
     if full[:len(prefix)] != prefix:
         raise ValueError('Chat template prompt is not a token prefix of completed chat')
+    if diagnostics is not None:
+        diagnostics.update(total_tokens=len(full), prompt_tokens=len(prefix),
+                           completion_tokens=len(full)-len(prefix))
     if len(full) > max_length:
         return None  # Never truncate away task context, code, or end-of-turn.
     if len(full) <= len(prefix):
