@@ -1,0 +1,4 @@
+# Install into your existing Slime runtime; no Slime/Megatron version pins.
+swanlab
+tensorboard
+jinja2

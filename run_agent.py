@@ -388,6 +388,10 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                     result['authentication_errors'] += int(bool(re.search(
                         r'Response status code is\s+(401|403)\b', raw_observation)))
                     declared_done = execution['declared_done']
+                if getattr(args, 'observation_tokens', 0):
+                    from observation_filter import bound_observation
+                    owner = getattr(backend, 'backend', backend)
+                    observation, _ = bound_observation(owner.observation_tokenizer, observation, args.observation_tokens)
                 result['steps'] = step
                 record(dict(type='turn', step=step, raw_completion=raw,
                     executed_code=code, observation=observation,
@@ -453,6 +457,8 @@ def parse_args():
     p.add_argument('--model-timeout', type=float, default=300)
     p.add_argument('--output-dir', type=Path, default=HERE / 'runs')
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--observation-tokens', type=int, default=0,
+                   help='Optional RL-matched observation token cap; 0 disables, requires --model tokenizer')
     p.add_argument('--concurrency', type=int, default=1,
         help='Independent task/World subprocesses in flight; model is loaded once')
     p.add_argument('--inference-batch-size', type=int, default=4,
@@ -471,6 +477,8 @@ def parse_args():
     if (a.limit < 0 or a.temperature < 0 or not 0 < a.top_p <= 1
             or a.concurrency < 1 or a.inference_batch_size < 1 or a.batch_wait_ms < 0):
         p.error('Invalid limit or sampling parameters')
+    if a.observation_tokens and (a.observation_tokens < 128 or not a.model):
+        p.error('--observation-tokens requires a local --model tokenizer and a cap >= 128')
     a.appworld_root = a.appworld_root.expanduser().resolve()
     if not a.appworld_root.is_dir():
         p.error('--appworld-root must be an existing directory with downloaded data')
@@ -512,6 +520,12 @@ def main():
     (out / 'config.json').write_text(json.dumps(dict(config=config, tasks=tasks,
         upstream=json.loads((HERE / 'upstream.json').read_text())), indent=2) + '\n')
     backend = TransformersBackend(args) if args.backend == 'transformers' else LocalAPIBackend(args)
+    if args.observation_tokens:
+        if hasattr(backend, 'tokenizer'):
+            backend.observation_tokenizer = backend.tokenizer
+        else:
+            from transformers import AutoTokenizer
+            backend.observation_tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     if args.backend == 'transformers' and args.concurrency > 1:
         backend = BatchingBackend(backend, args.inference_batch_size, args.batch_wait_ms)
     results = []
