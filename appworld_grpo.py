@@ -51,8 +51,11 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
             if remaining < 16:
                 reason = 'context_limit'
                 break
-            params = dict(sampling_params, max_new_tokens=min(cfg['max_new_tokens'], remaining),
-                          seed=(cfg['seed']+int(sample.index or 0)*1000003+turn) % (2**31))
+            params = dict(sampling_params)
+            # /generate uses SamplingParams.sampling_seed, not the OpenAI-style seed.
+            params.pop('seed', None)
+            params.update(max_new_tokens=min(cfg['max_new_tokens'], remaining),
+                          sampling_seed=(cfg['seed']+int(sample.index or 0)*1000003+turn) % (2**31))
             output = await post(f'http://{args.sglang_router_ip}:{args.sglang_router_port}/generate',
                 dict(input_ids=tokens.copy(), sampling_params=params, return_logprob=True))
             finish = output['meta_info']['finish_reason']['type']

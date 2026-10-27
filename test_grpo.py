@@ -69,12 +69,16 @@ class GRPOTests(unittest.TestCase):
                     output_token_logprobs=[[-.5,token,None] for token in ids]))
             with patch.dict(os.environ,APPWORLD_GRPO_CONFIG=str(self.config(directory))):
                 sample = asyncio.run(run_episode(SimpleNamespace(sglang_router_ip='localhost',
-                    sglang_router_port=123),self.sample(),{},ChatTokenizer(),post,Worker))
+                    sglang_router_port=123),self.sample(),{'seed':99},ChatTokenizer(),post,Worker))
             self.assertEqual(sample.reward,1)
             self.assertEqual(sum(sample.loss_mask),sum(len(code)+1 for code in codes))
             self.assertTrue(0 in sample.loss_mask)
             self.assertEqual(len(sample.loss_mask),len(sample.rollout_log_probs))
             self.assertGreater(len(payloads[1]['input_ids']),len(payloads[0]['input_ids']))
+            self.assertTrue(all('seed' not in p['sampling_params'] for p in payloads))
+            self.assertTrue(all('sampling_seed' in p['sampling_params'] for p in payloads))
+            self.assertNotEqual(payloads[0]['sampling_params']['sampling_seed'],
+                                payloads[1]['sampling_params']['sampling_seed'])
             action_logps = [p for p,m in zip(sample.rollout_log_probs,sample.loss_mask) if m]
             self.assertTrue(all(p==-.5 for p in action_logps))
             self.assertTrue(Worker.instances[-1].closed)
