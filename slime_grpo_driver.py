@@ -11,8 +11,9 @@ if __name__ == '__main__':
     import ray
     script, *arguments = sys.argv[1:]
     keys = ['APPWORLD_GRPO_CONFIG', 'TENSORBOARD_DIR', 'PYTHONPATH',
-            'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE', 'CUDA_DEVICE_MAX_CONNECTIONS']
-    ray.init(runtime_env={'env_vars': {k:os.environ[k] for k in keys if k in os.environ}})
+            'HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE', 'CUDA_DEVICE_MAX_CONNECTIONS',
+            'PYTHONUNBUFFERED', 'RAY_DEDUP_LOGS']
+    ray.init(log_to_driver=True, runtime_env={'env_vars': {k:os.environ[k] for k in keys if k in os.environ}})
     sys.argv = [script, *arguments]
     try:
         runpy.run_path(script, run_name='__main__')

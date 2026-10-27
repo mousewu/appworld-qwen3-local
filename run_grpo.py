@@ -9,6 +9,7 @@ import time
 import uuid
 
 from grpo_tracking import SwanLabBridge
+from process_logging import ProcessLogRelay
 from run_agent import WorldProcess
 from slime_runtime import find_training_script
 
@@ -87,6 +88,8 @@ def main():
     p.add_argument('--swanlab-mode', choices=['offline','cloud','disabled'], default='offline')
     p.add_argument('--swanlab-project', default='appworld-grpo')
     p.add_argument('--swanlab-name', default=None)
+    p.add_argument('--log-upload-interval', type=float, default=60,
+                   help='Seconds between full-log/episode file syncs to SwanLab')
     p.add_argument('--dry-run', action='store_true', help='Validate/create configs and print command without allocating GPUs')
     a = p.parse_args()
     for key in ['model','appworld_root','output_dir','init_checkpoint','ref_checkpoint']:
@@ -96,6 +99,8 @@ def main():
         p.error('Counts and sizes must be positive')
     if a.num_gpus % a.rollout_tp or a.observation_tokens < 128 or a.context_length < 1024 or a.temperature <= 0:
         p.error('Invalid rollout TP, observation/context budget or sampling temperature')
+    if a.log_upload_interval <= 0:
+        p.error('--log-upload-interval must be positive')
     if a.learning_rate <= 0 or a.kl_coef < 0 or a.env_timeout <= 0 or not 0 < a.sglang_memory < 1:
         p.error('Invalid learning rate, KL coefficient, timeout or SGLang memory fraction')
     if a.output_dir.exists():
@@ -130,15 +135,24 @@ def main():
         return
     env = os.environ.copy()
     env.update(APPWORLD_GRPO_CONFIG=str(cfg_path),TENSORBOARD_DIR=str(a.output_dir/'tensorboard'),
-        PYTHONPATH=str(HERE)+os.pathsep+env.get('PYTHONPATH',''), CUDA_DEVICE_MAX_CONNECTIONS='1')
+        PYTHONPATH=str(HERE)+os.pathsep+env.get('PYTHONPATH',''), CUDA_DEVICE_MAX_CONNECTIONS='1',
+        PYTHONUNBUFFERED='1', RAY_DEDUP_LOGS='0')
     bridge = SwanLabBridge(a.output_dir,a.swanlab_mode,a.swanlab_project,
                            a.swanlab_name or a.output_dir.name,cfg)
     proc = None
+    relay = None
+    started = time.time()
     try:
-        proc = subprocess.Popen(command,env=env,cwd=script.parent)
+        print('Starting Slime command:', ' '.join(command), flush=True)
+        proc = subprocess.Popen(command,env=env,cwd=script.parent,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+        relay = ProcessLogRelay(proc.stdout, a.output_dir/'training.log').start()
         while proc.poll() is None:
+            if relay.error is not None:
+                raise RuntimeError(f'Training log relay failed: {relay.error}')
             try:
                 bridge.poll()
+                bridge.sync_files()
             except Exception as exc:
                 print(f'SwanLab forwarding failed; native files retained: {exc}', file=sys.stderr)
             time.sleep(5)
@@ -152,6 +166,13 @@ def main():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+        if relay is not None:
+            try:
+                relay.finish()
+            except Exception as exc:
+                print(f'Training log finalization failed: {exc}', file=sys.stderr)
+        (a.output_dir/'run_status.json').write_text(json.dumps(dict(
+            returncode=proc.returncode if proc else None, started_at=started, finished_at=time.time()), indent=2))
         try:
             bridge.finish()
         except Exception as exc:

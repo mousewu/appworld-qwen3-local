@@ -178,3 +178,54 @@ raising infrastructure failures and SwanLab event deduplication. Tests use simul
 AppWorld/SGLang/TensorBoard objects; there is no CUDA, live SGLang or Megatron training
 on the development Mac. Use a two-update server smoke run before a full experiment;
 check a saved episode, mask lengths, finite native losses, weight sync and HF export.
+
+## Full console and episode-file synchronization to SwanLab
+
+The launcher now pipes the training child's **merged stdout/stderr** back through the
+parent process's SwanLab console proxy. This includes Slime/Ray worker output forwarded
+to the driver, native warnings and Python exception stacks. Ray starts with
+`log_to_driver=True` and `RAY_DEDUP_LOGS=0`, so repeated worker errors are not intentionally
+collapsed by Ray in this run. Output is drained on a dedicated thread while metric
+polling continues, and also saved without line truncation to `OUTPUT_DIR/training.log`.
+The child's nonzero exit status is preserved. Graceful error/interrupt handling drains
+remaining output before calling SwanLab finish.
+
+SwanLab's Logs UI/SDK can impose per-line length and display limits. To retain the
+complete original stream, the project additionally calls the public `swanlab.save()`
+API for a file allowlist, periodically and again before finishing:
+
+- `training.log`;
+- `episodes/*.json` (every completed episode's stored turns, code and bounded feedback);
+- `project_metrics/*.json`;
+- `project_config.json`, `command.json`, `train_tasks.jsonl`, `run_status.json`.
+
+No model checkpoint or arbitrary directory is uploaded. Files already submitted with
+unchanged size/mtime are not resubmitted; the growing training.log is resubmitted when
+changed. Default file-sync interval is 60 seconds. Override it with:
+
+```bash
+SWANLAB_MODE=cloud bash run_grpo.sh --log-upload-interval 30
+```
+
+In cloud mode, console output and saved files are sent to the current run; in offline
+mode they remain in the SDK's local run storage for later sync. Disabled mode still
+writes the full local training.log, but does not send anything to SwanLab. Check the
+run's Logs view for console output and its file listing for saved artifacts (UI placement
+varies). This requires a SwanLab SDK exposing public `save(glob_str, base_path, policy)`;
+if absent, the project explicitly reports that files are local only. SDK submission
+and the final SDK flush are not independent verification of server-side retention.
+
+Only output written/forwarded to the child process's stdout/stderr is in training.log.
+Private Ray log files never forwarded to the driver are not automatically harvested.
+Episode files contain the actual **bounded** observations the policy received, not
+unlimited pre-truncation API payloads. An episode that never completes due to an
+infrastructure exception may have no episode JSON; its exception remains in the console
+log. Hard machine termination/SIGKILL cannot guarantee a final upload; periodic sync
+limits how much remains only on disk.
+
+A new launch is required to enable subprocess capture; this does not retroactively
+collect stdout from an already-running process. Existing metric forwarding continues
+unchanged. Full-log/file synchronization is covered by CPU subprocess tests, including
+stderr, Unicode, lines longer than the UI limit, exit status, file allowlisting and
+resubmission after change. Cloud delivery and a live GPU/Ray run still need verification
+in the server environment.
