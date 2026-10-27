@@ -88,6 +88,12 @@ def prompt_messages(supervisor, instruction):
 def extract_code(text):
     """Accept raw Python or exactly one fenced/code-tag block; never repair code."""
     text = text.strip()
+    # Native SGLang may retain decoded EOS markers (no_stop_trim/skip_special_tokens).
+    # Remove only trailing Qwen chat terminators for execution. Sampled training
+    # tokens/logprobs are owned by the rollout adapter and must remain untouched.
+    while text.endswith(('<|im_end|>', '<|endoftext|>')):
+        marker = '<|im_end|>' if text.endswith('<|im_end|>') else '<|endoftext|>'
+        text = text[:-len(marker)].rstrip()
     if not text:
         raise ValueError('Empty model response')
     if '<think>' in text or '</think>' in text:

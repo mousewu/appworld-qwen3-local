@@ -131,6 +131,25 @@ class GRPOTests(unittest.TestCase):
             self.assertEqual(sample.reward,0)
             self.assertEqual(sample.metadata['appworld']['termination'],'generation_limit')
 
+    def test_eos_text_is_not_python_but_sampled_eos_ids_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code='apis.supervisor.complete_task()'
+            raw=code+'<|im_end|>'
+            ids=list(raw.encode())
+            async def post(*args):
+                return dict(text=raw,meta_info=dict(finish_reason=dict(type='stop'),
+                    output_token_logprobs=[[-.5,t,None] for t in ids]))
+            with patch.dict(os.environ,APPWORLD_GRPO_CONFIG=str(self.config(directory))):
+                sample=asyncio.run(run_episode(SimpleNamespace(sglang_router_ip='x',sglang_router_port=1),
+                    self.sample(),{},ChatTokenizer(),post,Worker))
+            executed=[kw['code'] for cmd,kw in Worker.instances[-1].calls if cmd=='execute']
+            self.assertEqual(executed,[code])
+            self.assertEqual(sample.tokens[-len(ids):],ids)
+            self.assertEqual(sample.loss_mask,[1]*len(ids))
+            self.assertEqual(sample.rollout_log_probs,[-.5]*len(ids))
+            self.assertEqual(sample.metadata['appworld']['format_errors'],0)
+            self.assertEqual(sample.reward,1)
+
     def test_group_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             samples=[]
@@ -144,6 +163,14 @@ class GRPOTests(unittest.TestCase):
             row=json.loads((Path(directory)/'project_metrics/00000000.json').read_text())
             self.assertEqual(row['metrics']['appworld/mixed_group_rate'],1)
             self.assertEqual(row['metrics']['appworld/success_rate'],.25)
+
+    def test_extractor_does_not_strip_internal_marker_or_repair_invalid_python(self):
+        from run_agent import extract_code
+        self.assertEqual(extract_code('print("<|im_end|>")<|im_end|>'), 'print("<|im_end|>")')
+        with self.assertRaises(SyntaxError):
+            extract_code('print(<|im_end|>')
+        with self.assertRaises(ValueError):
+            extract_code('<|im_end|>')
 
     def test_reject_misaligned_log_probs(self):
         with self.assertRaises(ValueError):
