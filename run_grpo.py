@@ -98,6 +98,8 @@ def main():
     p.add_argument('--context-length', type=int, default=16384)
     p.add_argument('--max-new-tokens', type=int, default=512)
     p.add_argument('--observation-tokens', type=int, default=2048)
+    p.add_argument('--env-timeout-retries', type=int, default=1,
+                   help='Bounded fresh-world replay recoveries per episode; exhausted failures stop training')
     p.add_argument('--env-timeout', type=float, default=120)
     p.add_argument('--temperature', type=float, default=0.8)
     p.add_argument('--learning-rate', type=float, default=1e-6)
@@ -123,6 +125,8 @@ def main():
     rollout_gpus = a.num_gpus-a.actor_gpus if a.async_training else a.num_gpus
     if rollout_gpus <= 0 or rollout_gpus % a.rollout_tp or a.observation_tokens < 128 or a.context_length < 1024 or a.temperature <= 0:
         p.error('Invalid rollout TP, observation/context budget or sampling temperature')
+    if a.env_timeout_retries < 0:
+        p.error('--env-timeout-retries must be nonnegative')
     if a.log_upload_interval <= 0:
         p.error('--log-upload-interval must be positive')
     if a.learning_rate <= 0 or a.kl_coef < 0 or a.env_timeout <= 0 or not 0 < a.sglang_memory < 1:

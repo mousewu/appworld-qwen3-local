@@ -136,3 +136,61 @@ The async entry/topology, utilization arithmetic, abort handling and option disp
 are CPU-tested; GPU utilization, live queue behavior and memory limits require real
 server validation. Refer to upstream native scheduling documentation:
 https://thudm.github.io/slime/advanced/rollout-scheduling.html
+
+### Timeout recovery and diagnosis
+
+The default remains four GPUs (two actor TP2, two rollout TP1). Environment
+calls use a 120-second deadline and one fresh-world recovery per episode:
+
+```bash
+SWANLAB_MODE=cloud bash run_grpo_async.sh --env-timeout 120 --env-timeout-retries 1
+```
+
+Keep the existing MODEL_PATH, APPWORLD_ROOT, APPWORLD_PYTHON and Slime setup.
+Use a fresh OUTPUT_DIR. No Slime or Megatron source modification/version pin is
+required. `--env-timeout-retries 0` disables recovery.
+
+On timeout, the worker is closed, a unique experiment is reset with the same
+seed, and every completed executable action is replayed. Reset information and
+replay results must match exactly before retrying the timed-out operation.
+Policy tokens/log probabilities are not regenerated or duplicated, and the
+four-trajectory group remains intact. Replay can fail for nondeterministic
+operations. Exhausted timeouts, replay divergence and other infrastructure
+errors still stop training explicitly; they are never silently scored zero or
+dropped from a group. This is bounded recovery, not a guarantee against persistent
+bad loops or a checkpoint-resume implementation.
+
+`episodes/<episode_id>.jsonl` is flushed for every event, including code before
+execution, raw generation with token log probabilities, raw environment results,
+timeouts, recovery and terminal failures. These files may be large. Existing
+completed `.json` episode summaries remain available. Files are synced through
+the existing SwanLab file bridge (default every 60 seconds and at shutdown);
+cloud mode is needed for online visibility. Hard process/host kills can prevent
+final upload; already flushed local journal lines remain available.
+
+SwanLab metrics:
+
+- `appworld/timing/{reset,generation,execute,evaluate,recovery,cleanup,env_slot_wait}_{mean,max}_seconds`
+  measure accumulated wall time per episode, averaged/maximized over a rollout
+  batch. Generation includes router/HTTP wait; execute includes timed-out calls;
+  recovery includes worker shutdown, reset and replay. Concurrent episode times
+  overlap: do not add these averages to infer batch wall time.
+- `appworld/timing/episode_mean_seconds`, `appworld/rollout_seconds` and
+  `appworld/timeout_recoveries` describe scored batches. Episode time excludes
+  semaphore wait and final cleanup.
+- `environment_events/*` are cumulative live journal counts, including failures
+  before a scored batch exists. Their x-axis is bridge event polls, not updates.
+- Existing `slime/*` native TensorBoard metrics retain training/weight-sync timings
+  exposed by the installed Slime. This bridge does not invent unavailable native
+  timing fields or patch the framework.
+
+For a later eight-GPU comparison (six TP1 rollout engines, two TP2 actor GPUs):
+
+```bash
+SWANLAB_MODE=cloud bash run_grpo_async_8gpu.sh --env-timeout 120 --env-timeout-retries 1
+```
+
+The batch remains eight tasks times four trajectories and MAX_ENVS remains 24,
+so the initial comparison isolates topology. Increase MAX_ENVS separately only
+after checking CPU pressure and timeout frequency. Eight GPUs do not guarantee
+70% utilization. Request GPUs/CPU/RAM from the job platform separately.

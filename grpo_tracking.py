@@ -28,6 +28,7 @@ class SwanLabBridge:
     def poll(self):
         if self.swanlab is None:
             return
+        self.poll_episode_events()
         for path in sorted((self.root/'project_metrics').glob('*.json')):
             if path in self.seen_rollouts:
                 continue
@@ -66,6 +67,32 @@ class SwanLabBridge:
             self.swanlab.log({'slime/'+tag:value}, step=int(step))
             self.seen_events.add(key)
 
+    def poll_episode_events(self):
+        # Separate event axis: includes failed/in-flight episodes, not only scored batches.
+        if not hasattr(self, 'journal_offsets'):
+            self.journal_offsets, self.journal_counts, self.journal_step = {}, {}, 0
+        changed = False
+        for path in (self.root/'episodes').glob('*.jsonl'):
+            with path.open() as stream:
+                stream.seek(self.journal_offsets.get(str(path), 0))
+                while True:
+                    offset = stream.tell()
+                    line = stream.readline()
+                    if not line or not line.endswith('\n'):
+                        stream.seek(offset)
+                        break
+                    event = json.loads(line)['event']
+                    if event in ('timeout', 'recovery_ready', 'recovery_failed',
+                                 'episode_error', 'episode_complete'):
+                        self.journal_counts[event] = self.journal_counts.get(event, 0)+1
+                        changed = True
+                self.journal_offsets[str(path)] = stream.tell()
+        if changed:
+            self.swanlab.log({'environment_events/'+key: self.journal_counts.get(key, 0)
+                for key in ('timeout', 'recovery_ready', 'recovery_failed',
+                            'episode_error', 'episode_complete')}, step=self.journal_step)
+            self.journal_step += 1
+
     def sync_files(self, force=False):
         if self.swanlab is None:
             return
@@ -83,6 +110,7 @@ class SwanLabBridge:
                  'command.json', 'train_tasks.jsonl', 'run_status.json',
                  'gpu_utilization.jsonl', 'gpu_summary.json']]
         paths += list((self.root/'episodes').glob('*.json'))
+        paths += list((self.root/'episodes').glob('*.jsonl'))
         paths += list((self.root/'project_metrics').glob('*.json'))
         for path in paths:
             if not path.is_file():
