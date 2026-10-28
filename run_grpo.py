@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from grpo_tracking import SwanLabBridge
 from process_logging import ProcessLogRelay
 from run_agent import WorldProcess
 from slime_runtime import find_training_script, find_async_training_script
+from resource_monitor import ResourceMonitor, diagnose, atomic_json
 from gpu_monitor import GPUMonitor
 
 HERE = Path(__file__).resolve().parent
@@ -174,10 +176,19 @@ def main():
                            a.swanlab_name or a.output_dir.name,cfg)
     monitor = GPUMonitor(a.output_dir, a.num_gpus, a.gpu_monitor_interval,
                          a.gpu_monitor_warmup, a.gpu_util_target)
+    resources = ResourceMonitor(a.output_dir, a.gpu_monitor_interval)
+    received_signal = None
+    def terminate(signum, frame):
+        nonlocal received_signal
+        received_signal = signum
+        raise SystemExit(128+signum)
+    old_handlers = {sig:signal.signal(sig, terminate) for sig in (signal.SIGTERM, signal.SIGINT)}
     proc = None
     relay = None
     started = time.time()
+    atomic_json(a.output_dir/'run_status.json', dict(state='running', started_at=started, launcher_pid=os.getpid()))
     try:
+        resources.start()
         print('Starting Slime command:', ' '.join(command), flush=True)
         proc = subprocess.Popen(command,env=env,cwd=script.parent,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
@@ -195,6 +206,9 @@ def main():
         if proc.returncode:
             raise SystemExit(proc.returncode)
     finally:
+        launcher_error = repr(sys.exc_info()[1]) if sys.exc_info()[1] else None
+        for sig in old_handlers:
+            signal.signal(sig, signal.SIG_IGN)
         if proc is not None and proc.poll() is None:
             proc.terminate()
             try:
@@ -208,12 +222,22 @@ def main():
             except Exception as exc:
                 print(f'Training log finalization failed: {exc}', file=sys.stderr)
         monitor.finish()
+        try:
+            resources.finish()
+        except Exception as exc:
+            print(f'Resource monitor finalization failed: {exc}', file=sys.stderr)
+        diagnosis = diagnose(a.output_dir, proc.returncode if proc else None, received_signal, launcher_error)
+        print('Exit diagnosis:', diagnosis['category'], flush=True)
         (a.output_dir/'run_status.json').write_text(json.dumps(dict(
+            state='finished', diagnosis=diagnosis['category'], received_signal=received_signal,
             returncode=proc.returncode if proc else None, started_at=started, finished_at=time.time()), indent=2))
         try:
             bridge.finish()
         except Exception as exc:
             print(f'SwanLab final flush failed; native files retained: {exc}', file=sys.stderr)
+        finally:
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
 
 
 if __name__ == '__main__':

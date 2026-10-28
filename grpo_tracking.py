@@ -28,6 +28,7 @@ class SwanLabBridge:
     def poll(self):
         if self.swanlab is None:
             return
+        self.poll_resource_metrics()
         self.poll_episode_events()
         for path in sorted((self.root/'project_metrics').glob('*.json')):
             if path in self.seen_rollouts:
@@ -66,6 +67,40 @@ class SwanLabBridge:
         for step, _, tag, value, key in sorted(events):
             self.swanlab.log({'slime/'+tag:value}, step=int(step))
             self.seen_events.add(key)
+
+    def poll_resource_metrics(self):
+        path = self.root/'resource_summary.json'
+        if path.is_file():
+            row = json.loads(path.read_text())
+            if row['sample'] != getattr(self, 'last_resource_sample', None):
+                cg = row.get('cgroup', {})
+                metrics = {'resources/host_cpu_percent':row['host_cpu_percent'],
+                    'resources/host_memory_percent':row['host_memory_percent'],
+                    'resources/host_available_gb':row['host_memory_available_bytes']/2**30,
+                    'resources/process_tree_rss_gb':row['process_tree_rss_bytes']/2**30,
+                    'resources/process_count':row['process_count'],
+                    'resources/cgroup_cpu_used_cores':row.get('cgroup_cpu_used_cores')}
+                for key in ('memory_bytes', 'memory_limit_bytes', 'memory_peak_bytes'):
+                    if cg.get(key) is not None:
+                        metrics['resources/cgroup_'+key.replace('_bytes', '_gb')] = cg[key]/2**30
+                if cg.get('memory_limit_bytes'):
+                    metrics['resources/cgroup_memory_percent'] = 100*cg['memory_bytes']/cg['memory_limit_bytes']
+                for key, value in row.get('memory_events_delta', {}).items():
+                    metrics['resources/memory_events_delta/'+key] = value
+                for key, value in cg.get('cpu_stat', {}).items():
+                    if 'throttl' in key:
+                        metrics['resources/cpu_stat/'+key] = value
+                self.swanlab.log({key:value for key,value in metrics.items() if value is not None}, step=row['sample'])
+                self.last_resource_sample = row['sample']
+        path = self.root/'exit_diagnosis.json'
+        if path.is_file() and not getattr(self, 'diagnosis_logged', False):
+            report = json.loads(path.read_text())
+            categories = ['container_oom_kill_observed', 'cuda_oom', 'environment_timeout',
+                'memory_pressure_reported', 'external_signal_unconfirmed', 'completed',
+                'incomplete_or_unobserved_exit', 'application_error']
+            self.swanlab.log({'exit/'+category:int(report['category'] == category)
+                             for category in categories}, step=0)
+            self.diagnosis_logged = True
 
     def poll_episode_events(self):
         # Separate event axis: includes failed/in-flight episodes, not only scored batches.
@@ -108,7 +143,8 @@ class SwanLabBridge:
         # Explicit allowlist: never upload model weights, arbitrary files, or credentials.
         paths = [self.root/name for name in ['training.log', 'project_config.json',
                  'command.json', 'train_tasks.jsonl', 'run_status.json',
-                 'gpu_utilization.jsonl', 'gpu_summary.json']]
+                 'gpu_utilization.jsonl', 'gpu_summary.json', 'resource_usage.jsonl',
+                 'resource_summary.json', 'resource_monitor_error.json', 'exit_diagnosis.json']]
         paths += list((self.root/'episodes').glob('*.json'))
         paths += list((self.root/'episodes').glob('*.jsonl'))
         paths += list((self.root/'project_metrics').glob('*.json'))

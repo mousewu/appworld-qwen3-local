@@ -194,3 +194,60 @@ The batch remains eight tasks times four trajectories and MAX_ENVS remains 24,
 so the initial comparison isolates topology. Increase MAX_ENVS separately only
 after checking CPU pressure and timeout frequency. Eight GPUs do not guarantee
 70% utilization. Request GPUs/CPU/RAM from the job platform separately.
+
+### CPU, RAM, OOM and exit diagnosis
+
+Install the updated project dependencies in the Slime/launcher environment:
+
+```bash
+python -m pip install -r requirements-grpo.txt
+```
+
+Both four- and eight-GPU launchers automatically start the independent resource
+monitor, sampled at `--gpu-monitor-interval` (default 5 seconds). It does not
+stop when nvidia-smi fails. It records:
+
+- Host CPU percentage and host available RAM; process-tree RSS and process count.
+  RSS sums shared pages and is not unique physical usage. Ray processes outside
+  the launcher's descendant tree may be missing; cgroup usage is the better
+  container-wide measure.
+- Current/limit/peak cgroup memory where supported, and memory event increments
+  since monitor startup. Cgroup v2 and v1 mount/membership paths are resolved;
+  unsupported files are omitted, not treated as evidence of no OOM.
+- Cgroup v2 CPU usage in cores, CPU quota and CPU throttle counters. Host CPU
+  percentage describes the host, not percentage of the container CPU quota.
+
+`resource_usage.jsonl` contains samples; `resource_summary.json` is an atomically
+updated heartbeat/latest sample. `resource_monitor_error.json` records collection
+errors. SwanLab receives `resources/*` scalars, including memory-event deltas,
+and all three files through the existing periodic file sync.
+
+On an observed child exit or launcher SIGTERM/SIGINT, `exit_diagnosis.json`
+automatically records the return code, launcher signal/error, recent log tail,
+resource evidence and a reason category. SwanLab receives `exit/*` one-hot
+metrics and the JSON artifact. `run_status.json` records the category too.
+
+Diagnosis categories distinguish observed cgroup OOM kills, CUDA OOM, AppWorld
+timeout, reported Ray memory pressure, unconfirmed external signals, application
+errors, normal completion and unobserved exits. An OOM counter increase proves
+an OOM kill occurred in the monitored cgroup hierarchy, not which process was
+killed or that it alone caused training termination. Existing counters from
+before this run are subtracted. Exit code 137 alone does not prove OOM or
+platform cancellation; manual kill and platform termination need platform logs.
+
+If the launcher receives SIGKILL or the entire container/host disappears, no
+in-process handler can perform a final upload. Previously synced evidence remains
+in SwanLab; flushed local files survive only if stored on persistent storage.
+After restarting, recover a diagnosis from the persisted output directory:
+
+```bash
+python diagnose_run.py /path/to/previous/output --returncode 137 \
+  --swanlab-mode cloud
+```
+
+Supply `--returncode` only when known from the platform; otherwise omit it.
+This creates a separate `<output-name>_diagnosis` SwanLab experiment; it does not
+resume or overwrite the original run. Without platform evidence the report says
+`incomplete_or_unobserved_exit` or `external_signal_unconfirmed`, not “platform
+kill confirmed.” The diagnostic uploader also requires the project TensorBoard
+and SwanLab dependencies. No Slime/Megatron framework changes are required.

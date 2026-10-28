@@ -2,3 +2,4 @@
 swanlab
 tensorboard
 jinja2
+psutil
