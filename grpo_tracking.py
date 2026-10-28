@@ -14,6 +14,7 @@ class SwanLabBridge:
         self.last_file_sync = 0.0
         self.file_sync_interval = config.get("log_upload_interval", 60)
         self.warned_no_save = False
+        self.last_gpu_sample = None
         self.swanlab = None
         if mode != 'disabled':
             import swanlab
@@ -36,6 +37,20 @@ class SwanLabBridge:
                 continue  # Writer may not have closed the current file yet.
             self.swanlab.log(row['metrics'], step=int(row['step']))
             self.seen_rollouts.add(path)
+        gpu_path = self.root/'gpu_summary.json'
+        if gpu_path.is_file():
+            report = json.loads(gpu_path.read_text())
+            if report['samples'] != getattr(self, 'last_gpu_sample', None):
+                gpu_metrics = {'hardware/gpu_mean_steady':report['steady_all_gpu_mean'],
+                               'hardware/monitor_seconds':report['monitored_seconds']}
+                if report['full_run_per_gpu_mean']:
+                    gpu_metrics['hardware/gpu_mean_full'] = sum(report['full_run_per_gpu_mean'].values())/len(report['full_run_per_gpu_mean'])
+                for row in report.get('latest_gpus', []):
+                    gpu_metrics[f'hardware/gpu_{row["index"]}/utilization'] = row['utilization']
+                    gpu_metrics[f'hardware/gpu_{row["index"]}/memory_used_mb'] = row['memory_used_mb']
+                gpu_metrics = {k:v for k,v in gpu_metrics.items() if v is not None}
+                self.swanlab.log(gpu_metrics, step=report['samples'])
+                self.last_gpu_sample = report['samples']
         events = []
         for path in (self.root/'tensorboard').rglob('events.out.tfevents.*'):
             if str(path) not in self.accumulators:
@@ -65,7 +80,8 @@ class SwanLabBridge:
             return
         # Explicit allowlist: never upload model weights, arbitrary files, or credentials.
         paths = [self.root/name for name in ['training.log', 'project_config.json',
-                 'command.json', 'train_tasks.jsonl', 'run_status.json']]
+                 'command.json', 'train_tasks.jsonl', 'run_status.json',
+                 'gpu_utilization.jsonl', 'gpu_summary.json']]
         paths += list((self.root/'episodes').glob('*.json'))
         paths += list((self.root/'project_metrics').glob('*.json'))
         for path in paths:

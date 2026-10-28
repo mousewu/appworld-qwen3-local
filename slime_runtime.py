@@ -31,6 +31,24 @@ def find_training_script(environ=None, module_origin=None):
                      'or SLIME_TRAIN_SCRIPT to its train.py. No version/commit is required.')
 
 
+def find_async_training_script(implementation='auto', environ=None, module_origin=None):
+    env = os.environ if environ is None else environ
+    script = find_training_script(env, module_origin)
+    legacy = script.parent / 'train_async.py'
+    if implementation in ('auto', 'pipeline') and legacy.is_file():
+        return legacy, 'pipeline'
+    if implementation == 'pipeline':
+        raise ValueError('Installed Slime has no train_async.py; use --async-implementation fully '
+                         'only if its native fully_async_rollout API is available')
+    if not (script.parent/'slime/rollout/fully_async_rollout.py').is_file():
+        import importlib.util
+        spec = importlib.util.find_spec('slime')
+        package = Path(spec.origin).parent if spec and spec.origin else Path('/nonexistent')
+        if not (package/'rollout/fully_async_rollout.py').is_file():
+            raise ValueError('No native Slime async entry/rollout implementation found')
+    return script.parent/'train.py', 'fully'
+
+
 if __name__ == '__main__':
     try:
         print(find_training_script())

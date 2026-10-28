@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import uuid
+import weakref
 
 from observation_filter import bound_observation
 from run_agent import (WorldProcess, chat_input_ids, extract_code, execution_feedback,
@@ -36,6 +37,9 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
         raise ValueError('AppWorld GRPO requires complete synchronous rollouts, not partial rollout')
     task_id = sample.metadata['task_id']
     episode_id = uuid.uuid4().hex
+    # An aborted episode is restarted, so its old policy-version history is no longer relevant.
+    if hasattr(sample, 'weight_versions'):
+        sample.weight_versions = []
     worker = worker_factory(cfg['appworld_python'], cfg['appworld_root'], cfg['env_timeout'])
     tokens, mask, log_probs, turns = [], [], [], []
     reason = 'step_limit'
@@ -60,12 +64,28 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                 dict(input_ids=tokens.copy(), sampling_params=params, return_logprob=True))
             finish = output['meta_info']['finish_reason']['type']
             if finish == 'abort':
-                raise RuntimeError('SGLang aborted a synchronous AppWorld rollout')
+                if not cfg.get('async_training'):
+                    raise RuntimeError('SGLang aborted a synchronous AppWorld rollout')
+                sample.tokens = tokens
+                sample.response_length = len(mask)
+                sample.loss_mask = mask
+                sample.rollout_log_probs = log_probs
+                sample.response = tokenizer.decode(tokens[len(initial):], skip_special_tokens=False)
+                sample.reward = None
+                sample.status = sample.Status.ABORTED
+                # Slime requeues aborted groups. Never score them as failures. A retried
+                # unfinished episode starts from a fresh world rather than replaying side effects.
+                return sample
             entries = output['meta_info']['output_token_logprobs']
             ids, values = [int(e[1]) for e in entries], [float(e[0]) for e in entries]
             if not ids or len(tokens)+len(ids) > cfg['context_length']:
                 raise ValueError('Empty generation or response exceeds context budget')
             append_segment(tokens, mask, log_probs, ids, True, values)
+            version = output['meta_info'].get('weight_version')
+            if version is not None:
+                if not hasattr(sample, 'weight_versions'):
+                    sample.weight_versions = []
+                sample.weight_versions.append(str(version))
             raw = output['text']
             if finish == 'length':
                 reason = 'generation_limit'
@@ -128,10 +148,18 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
         await asyncio.to_thread(worker.close)
 
 
+_ENV_SEMAPHORES = weakref.WeakKeyDictionary()
+
+
 async def generate(args, sample, sampling_params, evaluation=False):
     from slime.rollout.sglang_rollout import GenerateState
     from slime.utils.http_utils import post
-    return await run_episode(args, sample, sampling_params, GenerateState(args).tokenizer, post)
+    cfg = config()
+    loop = asyncio.get_running_loop()
+    if loop not in _ENV_SEMAPHORES:
+        _ENV_SEMAPHORES[loop] = asyncio.Semaphore(cfg.get('max_envs', 32))
+    async with _ENV_SEMAPHORES[loop]:
+        return await run_episode(args, sample, sampling_params, GenerateState(args).tokenizer, post)
 
 
 async def reward(args, sample, **kwargs):

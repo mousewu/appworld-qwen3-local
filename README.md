@@ -1,3 +1,5 @@
+> **四卡异步 GRPO：见 [ASYNC_GRPO.md](ASYNC_GRPO.md)，入口 `bash run_grpo_async.sh`；包含 GPU 利用率与内存统计。**
+
 > **同步 GRPO：见 [GRPO.md](GRPO.md)，入口 `bash run_grpo.sh`，支持项目端 SwanLab。**
 
 > **SFT 当前入口已切换到 Slime 全参训练：见 [SLIME_SFT.md](SLIME_SFT.md)。**

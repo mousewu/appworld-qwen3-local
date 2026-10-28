@@ -11,20 +11,23 @@ import uuid
 from grpo_tracking import SwanLabBridge
 from process_logging import ProcessLogRelay
 from run_agent import WorldProcess
-from slime_runtime import find_training_script
+from slime_runtime import find_training_script, find_async_training_script
+from gpu_monitor import GPUMonitor
 
 HERE = Path(__file__).resolve().parent
 
 
 def training_args(a, prompt_file, output, model_config):
     batch = a.tasks_per_batch*4
-    if a.num_gpus % a.tp_size or batch % (a.num_gpus//a.tp_size):
+    actor_gpus = a.actor_gpus if a.async_training else a.num_gpus
+    rollout_gpus = a.num_gpus-actor_gpus if a.async_training else a.num_gpus
+    if actor_gpus <= 0 or rollout_gpus <= 0 or actor_gpus % a.tp_size or batch % (actor_gpus//a.tp_size):
         raise ValueError('GPU count must be divisible by TP and global batch by DP')
     rope = model_config.get('rope_theta', model_config.get('rope_parameters', {}).get('rope_theta'))
     if model_config.get('model_type') != 'qwen3' or model_config.get('hidden_size') != 2560:
         raise ValueError('This launcher supports Qwen3-4B checkpoints')
-    args = ['--actor-num-nodes','1','--actor-num-gpus-per-node',str(a.num_gpus),
-        '--rollout-num-gpus',str(a.num_gpus),'--colocate',
+    args = ['--actor-num-nodes','1','--actor-num-gpus-per-node',str(actor_gpus),
+        '--rollout-num-gpus',str(rollout_gpus),
         '--rollout-num-gpus-per-engine',str(a.rollout_tp),
         '--hf-checkpoint',str(a.model),'--load',str(a.init_checkpoint or a.model),
         '--ref-load',str(a.ref_checkpoint or a.model),
@@ -53,6 +56,17 @@ def training_args(a, prompt_file, output, model_config):
         '--max-position-embeddings',str(model_config['max_position_embeddings']),
         '--sglang-mem-fraction-static',str(a.sglang_memory),
         '--use-tensorboard','--tb-project-name','appworld_grpo','--seed',str(a.seed)]
+    if a.async_training:
+        args += ['--use-tis','--tis-clip', '2.0', '--tis-clip-low','0.0',
+                 '--sglang-server-concurrency',str(a.server_concurrency),
+                 '--use-dynamic-batch-size','--max-tokens-per-gpu',str(a.train_max_tokens)]
+        if a.async_implementation == 'pipeline':
+            args += ['--update-weights-interval','1']
+        if a.async_implementation == 'fully':
+            args += ['--rollout-function-path',
+                     'slime.rollout.fully_async_rollout.generate_rollout_fully_async']
+    else:
+        args.append('--colocate')
     if a.tp_size > 1:
         args.append('--sequence-parallel')
     if not a.no_save_hf:
@@ -66,6 +80,15 @@ def main():
     p.add_argument('--appworld-python', required=True)
     p.add_argument('--appworld-root', required=True, type=Path)
     p.add_argument('--output-dir', required=True, type=Path)
+    p.add_argument('--async-training', action='store_true')
+    p.add_argument('--async-implementation', choices=['auto','pipeline','fully'], default='auto')
+    p.add_argument('--actor-gpus', type=int, default=2)
+    p.add_argument('--max-envs', type=int, default=24, help='Per-node active AppWorld processes cap')
+    p.add_argument('--server-concurrency', type=int, default=16, help='Concurrent trajectories per serving engine')
+    p.add_argument('--train-max-tokens', type=int, default=16384)
+    p.add_argument('--gpu-util-target', type=float, default=70)
+    p.add_argument('--gpu-monitor-interval', type=float, default=5)
+    p.add_argument('--gpu-monitor-warmup', type=float, default=120)
     p.add_argument('--num-gpus', type=int, default=2)
     p.add_argument('--tp-size', type=int, default=2)
     p.add_argument('--rollout-tp', type=int, default=2)
@@ -97,7 +120,8 @@ def main():
             setattr(a,key,getattr(a,key).expanduser().resolve())
     if min(a.num_gpus,a.tp_size,a.rollout_tp,a.tasks_per_batch,a.updates,a.max_steps,a.max_new_tokens) <= 0:
         p.error('Counts and sizes must be positive')
-    if a.num_gpus % a.rollout_tp or a.observation_tokens < 128 or a.context_length < 1024 or a.temperature <= 0:
+    rollout_gpus = a.num_gpus-a.actor_gpus if a.async_training else a.num_gpus
+    if rollout_gpus <= 0 or rollout_gpus % a.rollout_tp or a.observation_tokens < 128 or a.context_length < 1024 or a.temperature <= 0:
         p.error('Invalid rollout TP, observation/context budget or sampling temperature')
     if a.log_upload_interval <= 0:
         p.error('--log-upload-interval must be positive')
@@ -108,7 +132,12 @@ def main():
     model_config = json.loads((a.model/'config.json').read_text())
     if a.context_length > model_config['max_position_embeddings']:
         p.error('Context budget exceeds model config')
-    script = find_training_script()
+    if min(a.max_envs, a.server_concurrency, a.gpu_monitor_interval, a.train_max_tokens) <= 0 or not 0 <= a.gpu_util_target <= 100 or a.gpu_monitor_warmup < 0:
+        p.error('Invalid concurrency/utilization monitoring settings')
+    if a.async_training:
+        script, a.async_implementation = find_async_training_script(a.async_implementation)
+    else:
+        script = find_training_script()
     worker = WorldProcess(a.appworld_python, a.appworld_root, a.env_timeout)
     try:
         task_ids = worker.call('list', split='train')
@@ -139,6 +168,8 @@ def main():
         PYTHONUNBUFFERED='1', RAY_DEDUP_LOGS='0')
     bridge = SwanLabBridge(a.output_dir,a.swanlab_mode,a.swanlab_project,
                            a.swanlab_name or a.output_dir.name,cfg)
+    monitor = GPUMonitor(a.output_dir, a.num_gpus, a.gpu_monitor_interval,
+                         a.gpu_monitor_warmup, a.gpu_util_target)
     proc = None
     relay = None
     started = time.time()
@@ -147,6 +178,7 @@ def main():
         proc = subprocess.Popen(command,env=env,cwd=script.parent,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
         relay = ProcessLogRelay(proc.stdout, a.output_dir/'training.log').start()
+        monitor.start()
         while proc.poll() is None:
             if relay.error is not None:
                 raise RuntimeError(f'Training log relay failed: {relay.error}')
@@ -171,6 +203,7 @@ def main():
                 relay.finish()
             except Exception as exc:
                 print(f'Training log finalization failed: {exc}', file=sys.stderr)
+        monitor.finish()
         (a.output_dir/'run_status.json').write_text(json.dumps(dict(
             returncode=proc.returncode if proc else None, started_at=started, finished_at=time.time()), indent=2))
         try:
