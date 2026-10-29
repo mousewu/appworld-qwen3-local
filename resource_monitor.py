@@ -1,6 +1,7 @@
 """Independent CPU/RAM/cgroup evidence and conservative exit diagnosis."""
 import json
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -165,26 +166,33 @@ def diagnose(output, returncode=None, received_signal=None, launcher_error=None)
         with path.open('rb') as stream:
             stream.seek(max(0, path.stat().st_size-256*1024))
             text = stream.read().decode(errors='replace')
-    lower = text.lower()
+    # Prefer the last typed exception over earlier recovered incidents/chained causes.
+    terminal_lines = [line for line in text.splitlines() if re.search(
+        r'\b([A-Za-z_][\w.]*(?:Error|Exception)|KeyboardInterrupt|SystemExit):', line)]
+    terminal_error = terminal_lines[-1] if terminal_lines else None
+    lower = (terminal_error or text).lower()
     delta = resource.get('memory_events_delta', {})
     evidence = []
     if delta.get('oom_kill', 0) > 0 or delta.get('oom_group_kill', 0) > 0:
         category = 'container_oom_kill_observed'
         evidence.append('Cgroup OOM kill counter increased since monitor start; victim identity is not proven.')
-    elif 'cuda out of memory' in lower or 'torch.outofmemoryerror' in lower:
-        category = 'cuda_oom'
-        evidence.append('CUDA OOM found in trailing training log.')
-    elif 'appworld' in lower and ('timeout recovery budget exhausted' in lower or 'appworld worker exceeded' in lower):
-        category = 'environment_timeout'
-        evidence.append('AppWorld timeout found in trailing training log.')
-    elif 'outofmemoryerror' in lower or 'memory pressure' in lower or 'node was running low on memory' in lower:
-        category = 'memory_pressure_reported'
-        evidence.append('Memory pressure/Ray OOM message found; does not prove kernel OOM kill.')
     elif received_signal or returncode in (-9, -15, 137, 143):
         category = 'external_signal_unconfirmed'
         evidence.append('Termination signal observed; platform cancellation, manual kill and OOM require external evidence to distinguish.')
     elif returncode == 0 and not launcher_error:
         category = 'completed'
+    elif 'recovery reset differs from original task' in lower or 'recovery replay diverged' in lower:
+        category = 'recovery_validation_failed'
+        evidence.append('Final exception reports reset identity mismatch or replay divergence after timeout recovery.')
+    elif 'cuda out of memory' in lower or 'torch.outofmemoryerror' in lower:
+        category = 'cuda_oom'
+        evidence.append('CUDA OOM found in final exception or trailing log when no typed exception is available.')
+    elif 'appworld' in lower and ('timeout recovery budget exhausted' in lower or 'appworld worker exceeded' in lower):
+        category = 'environment_timeout'
+        evidence.append('Final exception reports AppWorld timeout (or trailing log when no typed exception is available).')
+    elif 'outofmemoryerror' in lower or 'memory pressure' in lower or 'node was running low on memory' in lower:
+        category = 'memory_pressure_reported'
+        evidence.append('Memory pressure/Ray OOM message found; does not prove kernel OOM kill.')
     elif returncode is None:
         category = 'incomplete_or_unobserved_exit'
         evidence.append('No observed child exit code; last heartbeat alone cannot prove platform termination.')
@@ -192,7 +200,7 @@ def diagnose(output, returncode=None, received_signal=None, launcher_error=None)
         category = 'application_error'
         evidence.append('Nonzero exit; inspect training log and episode journals.')
     report = dict(category=category, returncode=returncode, received_signal=received_signal,
-        launcher_error=launcher_error, evidence=evidence, resource=resource,
+        launcher_error=launcher_error, terminal_error=terminal_error, evidence=evidence, resource=resource,
         last_heartbeat_age_seconds=time.time()-resource['timestamp'] if resource else None,
         generated_at=time.time(), log_tail=text[-12000:],
         limitation='SIGKILL/whole-container termination prevents final diagnosis/upload. Use persisted heartbeat and platform exit events; no inference of platform cause without evidence.')

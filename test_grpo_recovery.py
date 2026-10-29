@@ -7,7 +7,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from appworld_grpo import run_episode
+from appworld_grpo import run_episode, task_identity
 from test_grpo import GRPOTests, Worker, ChatTokenizer
 
 
@@ -22,6 +22,13 @@ class RecoveryTests(unittest.TestCase):
                         if mode == 'exhaust' or Flaky.attempts == 1:
                             raise TimeoutError('execute timed out')
                     result = super().call(command, **kwargs)
+                    if command == 'reset':
+                        result = dict(result, runtime=dict(constructor_kwargs=dict(
+                            experiment_name=kwargs['experiment_name'])))
+                        if Flaky.attempts and mode == 'instruction_changed':
+                            result['instruction'] = 'Different task'
+                        if Flaky.attempts and mode == 'supervisor_changed':
+                            result['supervisor'] = dict(result['supervisor'], email='changed@example.com')
                     if mode == 'diverge' and command == 'execute' and Flaky.attempts:
                         result = dict(result, observation='different replay result')
                     return result
@@ -48,9 +55,17 @@ class RecoveryTests(unittest.TestCase):
             self.assertIn('timeout', [e['event'] for e in events])
             self.assertEqual(events[-1]['event'], 'episode_closed')
             self.assertEqual(len(generated), 2)  # recovery never resamples policy tokens
+            if mode in ('instruction_changed', 'supervisor_changed', 'diverge'):
+                self.assertIn('recovery_failed', [e['event'] for e in events])
             if mode != 'recover':
                 self.assertIn('episode_error', [e['event'] for e in events])
             self.assertTrue(Worker.instances[-1].closed)
+
+    def test_changed_instruction_rejected(self): self.run_case('instruction_changed')
+    def test_changed_supervisor_rejected(self): self.run_case('supervisor_changed')
+
+    def test_missing_identity_field_rejected(self):
+        with self.assertRaises(KeyError): task_identity({'runtime': {}})
 
     def test_recover_with_exact_replay(self): self.run_case('recover')
     def test_exhaustion_preserves_failure_journal(self): self.run_case('exhaust')

@@ -18,6 +18,14 @@ def config():
     return json.loads(Path(os.environ['APPWORLD_GRPO_CONFIG']).read_text())
 
 
+def task_identity(reset_result):
+    """Prompt-defining fields only; runtime contains changing experiment paths.
+
+    Require both task fields so malformed reset responses cannot compare equal.
+    """
+    return {key: reset_result[key] for key in ('instruction', 'supervisor')}
+
+
 def append_segment(tokens, mask, log_probs, ids, trainable, values=None):
     if not ids:
         return
@@ -91,15 +99,15 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                     # A unique experiment avoids reusing partially modified databases/files.
                     replay_reset = dict(reset_args, experiment_name=reset_args['experiment_name']+f'_recovery_{recoveries}')
                     restored = await asyncio.to_thread(worker.call, 'reset', **replay_reset)
-                    if command != 'reset' and restored != task:
+                    if command != 'reset' and task_identity(restored) != task_identity(task):
                         raise RuntimeError('Recovery reset differs from original task')
                     for old_code, old_result in history:
                         replayed = await asyncio.to_thread(worker.call, 'execute', code=old_code)
                         if replayed != old_result:
                             raise RuntimeError('Recovery replay diverged; refusing inconsistent training sample')
                     record('recovery_ready', attempt=recoveries, replayed_actions=len(history))
-                except TimeoutError as replay_error:
-                    record('recovery_failed', error=str(replay_error))
+                except Exception as replay_error:
+                    record('recovery_failed', error_type=type(replay_error).__name__, error=str(replay_error))
                     raise
                 finally:
                     timings['recovery'] += time.monotonic()-recovery_start

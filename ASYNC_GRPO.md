@@ -153,6 +153,9 @@ required. `--env-timeout-retries 0` disables recovery.
 On timeout, the worker is closed, a unique experiment is reset with the same
 seed, and every completed executable action is replayed. Reset information and
 replay results must match exactly before retrying the timed-out operation.
+Reset identity compares only `instruction` and `supervisor`, the fields used to
+construct the prompt. Runtime diagnostics such as the intentionally changed
+experiment name are excluded; both task fields must exist.
 Policy tokens/log probabilities are not regenerated or duplicated, and the
 four-trajectory group remains intact. Replay can fail for nondeterministic
 operations. Exhausted timeouts, replay divergence and other infrastructure
@@ -251,3 +254,12 @@ resume or overwrite the original run. Without platform evidence the report says
 `incomplete_or_unobserved_exit` or `external_signal_unconfirmed`, not “platform
 kill confirmed.” The diagnostic uploader also requires the project TensorBoard
 and SwanLab dependencies. No Slime/Megatron framework changes are required.
+
+Exit classification now prefers the final typed exception in a chained traceback
+rather than earlier recovered errors. Reset mismatch and replay divergence map to
+`recovery_validation_failed` (`exit/recovery_validation_failed` in SwanLab), and
+`exit_diagnosis.json` includes `terminal_error`. Recovery failures of any exception
+type also emit a `recovery_failed` journal event. Cgroup OOM-kill evidence retains
+priority; explicit termination signals and clean successful exits are not
+misclassified from an earlier timeout message. The log parser is best effort for
+interleaved distributed logs; inspect the retained traceback for confirmation.

@@ -71,3 +71,33 @@ class ResourceTests(unittest.TestCase):
             diagnose(root, 137)
             bridge.poll_resource_metrics()
             self.assertEqual(logs[-1]['exit/container_oom_kill_observed'], 1)
+
+    def test_terminal_exception_overrides_earlier_timeout_and_swanlab_category(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root/'training.log'
+            for final in ('RuntimeError: Recovery reset differs from original task',
+                          'RuntimeError: Recovery replay diverged; refusing inconsistent training sample'):
+                log.write_text('TimeoutError: AppWorld worker exceeded 120s during execute\n'
+                               'During handling of the above exception, another exception occurred:\n'+final+'\n')
+                report = diagnose(root, 1)
+                self.assertEqual(report['category'], 'recovery_validation_failed')
+                self.assertEqual(report['terminal_error'], final)
+                logs = []
+                bridge = SwanLabBridge(root, 'disabled', 'test', 'test', {})
+                bridge.swanlab = SimpleNamespace(log=lambda values, **kw: logs.append(values))
+                bridge.poll_resource_metrics()
+                self.assertEqual(logs[-1]['exit/recovery_validation_failed'], 1)
+                self.assertEqual(logs[-1]['exit/environment_timeout'], 0)
+
+    def test_stale_timeout_does_not_hide_other_terminal_error_or_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'training.log').write_text('TimeoutError: AppWorld worker exceeded 120s during execute\n'
+                                           'ValueError: later unrelated failure\n')
+            self.assertEqual(diagnose(root, 1)['category'], 'application_error')
+            self.assertEqual(diagnose(root, 0)['category'], 'completed')
+            self.assertEqual(diagnose(root, -15)['category'], 'external_signal_unconfirmed')
+            (root/'training.log').write_text('RuntimeError: earlier error\n'
+                'TimeoutError: AppWorld timeout recovery budget exhausted; inspect journal\n')
+            self.assertEqual(diagnose(root, 1)['category'], 'environment_timeout')

@@ -96,7 +96,7 @@ class SwanLabBridge:
         if path.is_file() and not getattr(self, 'diagnosis_logged', False):
             report = json.loads(path.read_text())
             categories = ['container_oom_kill_observed', 'cuda_oom', 'environment_timeout',
-                'memory_pressure_reported', 'external_signal_unconfirmed', 'completed',
+                'memory_pressure_reported', 'recovery_validation_failed', 'external_signal_unconfirmed', 'completed',
                 'incomplete_or_unobserved_exit', 'application_error']
             self.swanlab.log({'exit/'+category:int(report['category'] == category)
                              for category in categories}, step=0)
