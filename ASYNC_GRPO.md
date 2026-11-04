@@ -263,3 +263,62 @@ type also emit a `recovery_failed` journal event. Cgroup OOM-kill evidence retai
 priority; explicit termination signals and clean successful exits are not
 misclassified from an earlier timeout message. The log parser is best effort for
 interleaved distributed logs; inspect the retained traceback for confirmation.
+
+### Four-GPU environment-concurrency comparison
+
+Run these as separate four-GPU jobs from the same SFT checkpoint and with the
+same `SLIME_DIR`, `APPWORLD_ROOT` and other model/environment settings:
+
+```bash
+bash run_grpo_async_compare.sh 24
+bash run_grpo_async_compare.sh 32
+```
+
+Both profiles use pipeline mode, two actor GPUs (TP2), two rollout GPUs (TP1),
+eight groups of four trajectories per update, 12 updates, and a 300-second
+cumulative environment execution budget. Only the active environment limit
+changes. Use the same `UPDATES` and `ENV_EXECUTE_BUDGET_SECONDS` overrides on both
+runs if needed. For example, use `UPDATES=32` to include the rollout index 21
+seen in the previous run.
+
+The budget sums caller-side wall time for execute calls, including retries and
+replayed actions. Reset, model generation and final evaluation are timed
+separately. A successful RPC that crosses the limit is allowed to finish so the
+world can be evaluated, then no further action is generated. Therefore the
+limit is checked at RPC boundaries and can overshoot by the last call. The
+original per-RPC timeout applies. An execution timeout or incomplete recovery
+at the budget boundary raises an explicit infrastructure error. The reward
+always comes from actual evaluation of a valid world. For other launchers,
+enable the same limit with `--env-execute-budget-seconds 300` (default 0 disables).
+
+In SwanLab compare:
+
+- `appworld/execute_budget_trigger_rate`, the fraction of scored trajectories
+  reaching the budget, including trajectories that complete on that same action.
+  `appworld/termination/execute_budget` counts trajectories stopped by the
+  limit. Budget crossings during failed calls/replay have separate
+  `environment_events/*` counters.
+- `appworld/timing/execute_total_p95_seconds`, `execute_total_max_seconds` under
+  the same prefix, and `appworld/slow_trajectory_count_ge_60s`. Each uploaded
+  `project_metrics/<rollout>.json` links the three slowest trajectories to their
+  episode IDs. Their journals contain individual execute durations and code.
+- `slime/perf/train_wait_time` and `slime/perf/wait_time_ratio`, forwarded by the
+  TensorBoard bridge when exposed by the installed Slime. Compare these with
+  rollout wall time, throughput and `hardware/gpu_mean_steady`.
+
+The local Slime checkout at `1b0415a2` has a native fully asynchronous entry
+point. It schedules complete groups and queues them as they finish, but its
+collector drains the queue and slices off only the target number of groups.
+The remainder is discarded, and the inspected collector has no explicit
+policy-age limit for queued groups. The comparison profiles therefore use the
+pipeline entry point. Verify the server checkout separately before evaluating
+fully asynchronous scheduling. On the training server, this checks whether
+the native fully asynchronous entry file can be located:
+
+```bash
+python -c "from slime_runtime import find_async_training_script; print(find_async_training_script('fully'))"
+```
+
+Entry-file detection is a capability check. Inspect the installed collector
+and run a short smoke test to validate group retention and policy age before
+selecting `ASYNC_IMPLEMENTATION=fully`.

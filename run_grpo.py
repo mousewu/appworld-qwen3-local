@@ -1,6 +1,7 @@
 """Launch synchronous four-trajectory AppWorld GRPO using installed Slime."""
 import argparse
 import json
+import math
 import os
 import signal
 from pathlib import Path
@@ -103,6 +104,8 @@ def main():
     p.add_argument('--env-timeout-retries', type=int, default=1,
                    help='Bounded fresh-world replay recoveries per episode; exhausted failures stop training')
     p.add_argument('--env-timeout', type=float, default=120)
+    p.add_argument('--env-execute-budget-seconds', type=float, default=0,
+                   help='Cumulative execute/replay seconds per episode, checked after each call (0 disables)')
     p.add_argument('--temperature', type=float, default=0.8)
     p.add_argument('--learning-rate', type=float, default=1e-6)
     p.add_argument('--kl-coef', type=float, default=0.01)
@@ -127,6 +130,8 @@ def main():
     rollout_gpus = a.num_gpus-a.actor_gpus if a.async_training else a.num_gpus
     if rollout_gpus <= 0 or rollout_gpus % a.rollout_tp or a.observation_tokens < 128 or a.context_length < 1024 or a.temperature <= 0:
         p.error('Invalid rollout TP, observation/context budget or sampling temperature')
+    if not math.isfinite(a.env_execute_budget_seconds) or a.env_execute_budget_seconds < 0:
+        p.error('--env-execute-budget-seconds must be finite and nonnegative')
     if a.env_timeout_retries < 0:
         p.error('--env-timeout-retries must be nonnegative')
     if a.log_upload_interval <= 0:

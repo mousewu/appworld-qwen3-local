@@ -54,6 +54,12 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
     reason = 'step_limit'
     started = time.monotonic()
     timings = Counter()
+    execute_budget = cfg.get('env_execute_budget_seconds', 0)
+    budget_triggered = False
+
+    def execute_seconds():
+        return timings['execute'] + timings['replay_execute']
+
     recoveries = 0
     history = []
     journal = Path(cfg['output_dir'])/'episodes'/f'{episode_id}.jsonl'
@@ -82,12 +88,16 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
         nonlocal worker, recoveries
         while True:
             record('env_start', command=command, arguments=kwargs)
+            before = timings[command]
             try:
                 result = await timed(command, lambda: asyncio.to_thread(worker.call, command, **kwargs))
-                record('env_end', command=command, result=result)
+                record('env_end', command=command, result=result, seconds=timings[command]-before)
                 return result
             except TimeoutError as exc:
-                record('timeout', command=command, error=str(exc))
+                record('timeout', command=command, error=str(exc), seconds=timings[command]-before)
+                if command == 'execute' and execute_budget and execute_seconds() >= execute_budget:
+                    record('execute_budget_during_timeout', seconds=execute_seconds(), budget_seconds=execute_budget)
+                    raise TimeoutError('AppWorld execute timed out after cumulative execution budget; inspect '+str(journal)) from exc
                 if recoveries >= cfg.get('env_timeout_retries', 1):
                     # Unknown infrastructure failures must never silently become reward zero.
                     raise TimeoutError('AppWorld timeout recovery budget exhausted; inspect '+str(journal)) from exc
@@ -102,7 +112,12 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                     if command != 'reset' and task_identity(restored) != task_identity(task):
                         raise RuntimeError('Recovery reset differs from original task')
                     for old_code, old_result in history:
-                        replayed = await asyncio.to_thread(worker.call, 'execute', code=old_code)
+                        replayed = await timed('replay_execute',
+                            lambda: asyncio.to_thread(worker.call, 'execute', code=old_code))
+                        if execute_budget and execute_seconds() >= execute_budget:
+                            record('execute_budget_during_replay', seconds=execute_seconds(),
+                                   budget_seconds=execute_budget)
+                            raise TimeoutError('AppWorld recovery replay exceeded cumulative execution budget; inspect '+str(journal))
                         if replayed != old_result:
                             raise RuntimeError('Recovery replay diverged; refusing inconsistent training sample')
                     record('recovery_ready', attempt=recoveries, replayed_actions=len(history))
@@ -175,12 +190,19 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                 observation, failed = execution_feedback(result['observation'])
                 done = result['declared_done']
                 kind = 'execution_error' if failed else 'execution_output'
+                if execute_budget and execute_seconds() >= execute_budget:
+                    budget_triggered = True
+                    record('execute_budget_reached', turn=turn+1, seconds=execute_seconds(),
+                           budget_seconds=execute_budget)
             observation, clipped = bound_observation(tokenizer, observation, cfg['observation_tokens'])
             turns.append(dict(turn=turn+1, raw_completion=raw, observation=observation,
                               feedback_kind=kind, observation_truncated=clipped))
             record('turn_end', **turns[-1])
             if done:
                 reason = 'declared_done'
+                break
+            if budget_triggered:
+                reason = 'execute_budget'
                 break
             if turn+1 == cfg['max_steps']:
                 break
@@ -208,7 +230,8 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
         # Limits are valid scored outcomes; do not let generic truncation filtering discard failures.
         sample.status = sample.Status.COMPLETED
         sample.metadata = dict(sample.metadata, appworld=dict(termination=reason, steps=len(turns),
-            timeout_recoveries=recoveries, timings=dict(timings),
+            episode_id=episode_id, execute_budget_triggered=budget_triggered,
+            execute_seconds=execute_seconds(), timeout_recoveries=recoveries, timings=dict(timings),
             episode_seconds=time.monotonic()-started,
             format_errors=sum(t['feedback_kind']=='format_error' for t in turns),
             execution_errors=sum(t['feedback_kind']=='execution_error' for t in turns),
@@ -274,16 +297,29 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
     for key in ['format_errors', 'execution_errors', 'observation_truncations']:
         metrics[key] = sum(s.metadata['appworld'][key] for s in flattened)
     metrics['timing/episode_mean_seconds'] = sum(s.metadata['appworld'].get('episode_seconds', 0) for s in flattened)/len(flattened)
-    for stage in ['reset', 'generation', 'execute', 'evaluate', 'recovery', 'cleanup', 'env_slot_wait']:
+    for stage in ['reset', 'generation', 'execute', 'replay_execute', 'evaluate', 'recovery', 'cleanup', 'env_slot_wait']:
         values = [s.metadata['appworld'].get('timings', {}).get(stage, 0) for s in flattened]
         metrics['timing/'+stage+'_mean_seconds'] = sum(values)/len(values)
         metrics['timing/'+stage+'_max_seconds'] = max(values)
     metrics['timeout_recoveries'] = sum(s.metadata['appworld'].get('timeout_recoveries', 0) for s in flattened)
-    for reason in ['step_limit', 'generation_limit', 'declared_done', 'context_limit']:
+    summaries = [(s, s.metadata['appworld']) for s in flattened]
+    execute_times = sorted(summary.get('execute_seconds', 0) for _, summary in summaries)
+    metrics['timing/execute_total_p95_seconds'] = execute_times[math.ceil(.95*len(execute_times))-1]
+    metrics['timing/execute_total_max_seconds'] = execute_times[-1]
+    metrics['slow_trajectory_count_ge_60s'] = sum(seconds >= 60 for seconds in execute_times)
+    metrics['execute_budget_trigger_count'] = sum(bool(summary.get('execute_budget_triggered'))
+                                                  for _, summary in summaries)
+    metrics['execute_budget_trigger_rate'] = metrics['execute_budget_trigger_count']/len(summaries)
+    slowest = [dict(task_id=s.metadata.get('task_id'), group_index=s.group_index,
+                    sample_index=s.index, episode_id=summary.get('episode_id'),
+                    execute_seconds=summary.get('execute_seconds', 0), termination=summary['termination'])
+               for s, summary in sorted(summaries, key=lambda pair: pair[1].get('execute_seconds', 0),
+                                        reverse=True)[:3]]
+    for reason in ['step_limit', 'generation_limit', 'declared_done', 'context_limit', 'execute_budget']:
         metrics['termination/'+reason] = 0
     for reason, count in Counter(s.metadata['appworld']['termination'] for s in flattened).items():
         metrics['termination/'+reason] = count
     path = Path(config()['output_dir'])/'project_metrics'/f'{rollout_id:08d}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(dict(step=rollout_id, metrics={'appworld/'+k:v for k,v in metrics.items()})))
+    path.write_text(json.dumps(dict(step=rollout_id, slowest_trajectories=slowest, metrics={'appworld/'+k:v for k,v in metrics.items()})))
     return False  # Keep Slime's native logs/TensorBoard reporting too.

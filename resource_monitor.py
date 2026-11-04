@@ -187,7 +187,8 @@ def diagnose(output, returncode=None, received_signal=None, launcher_error=None)
     elif 'cuda out of memory' in lower or 'torch.outofmemoryerror' in lower:
         category = 'cuda_oom'
         evidence.append('CUDA OOM found in final exception or trailing log when no typed exception is available.')
-    elif 'appworld' in lower and ('timeout recovery budget exhausted' in lower or 'appworld worker exceeded' in lower):
+    elif 'appworld' in lower and ('timeout recovery budget exhausted' in lower or 'appworld worker exceeded' in lower
+                                    or 'cumulative execution budget' in lower):
         category = 'environment_timeout'
         evidence.append('Final exception reports AppWorld timeout (or trailing log when no typed exception is available).')
     elif 'outofmemoryerror' in lower or 'memory pressure' in lower or 'node was running low on memory' in lower:

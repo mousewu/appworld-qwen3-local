@@ -150,19 +150,60 @@ class GRPOTests(unittest.TestCase):
             self.assertEqual(sample.metadata['appworld']['format_errors'],0)
             self.assertEqual(sample.reward,1)
 
+    def test_cumulative_execute_budget_stops_before_next_generation_and_evaluates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = self.config(directory)
+            cfg.write_text(json.dumps(dict(json.loads(cfg.read_text()), env_execute_budget_seconds=3)))
+            clock = SimpleNamespace(seconds=0)
+            generated = []
+
+            class SlowWorker(Worker):
+                def call(self, command, **kwargs):
+                    if command == 'execute':
+                        clock.seconds += 2
+                    return super().call(command, **kwargs)
+
+            async def post(*args):
+                generated.append('x=1')
+                return dict(text='x=1', meta_info=dict(finish_reason=dict(type='stop'),
+                    output_token_logprobs=[[-.5,33,None]]))
+
+            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)), \
+                 patch('appworld_grpo.time', SimpleNamespace(monotonic=lambda: clock.seconds)):
+                result = asyncio.run(run_episode(SimpleNamespace(sglang_router_ip='x',
+                    sglang_router_port=1), self.sample(), {}, ChatTokenizer(), post, SlowWorker))
+            self.assertEqual(generated, ['x=1', 'x=1'])
+            self.assertEqual(result.reward, 1)  # Actual evaluate result, even at budget cutoff.
+            self.assertEqual(result.status, 'completed')
+            self.assertEqual(result.metadata['appworld']['termination'], 'execute_budget')
+            self.assertEqual(result.metadata['appworld']['execute_seconds'], 4)
+            self.assertEqual([call for call, _ in Worker.instances[-1].calls],
+                             ['reset', 'execute', 'execute', 'evaluate'])
+            journal = next((Path(directory)/'episodes').glob('*.jsonl'))
+            events = [json.loads(line) for line in journal.read_text().splitlines()]
+            self.assertIn('execute_budget_reached', [row['event'] for row in events])
+            self.assertEqual([row['seconds'] for row in events
+                              if row['event']=='env_end' and row['command']=='execute'], [2, 2])
+
     def test_group_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             samples=[]
             for i,reward in enumerate([0,1,0,0]):
                 s=self.sample();s.reward=reward;s.loss_mask=[1,0,1]
                 s.metadata['appworld']=dict(steps=2,format_errors=0,execution_errors=0,
-                    observation_truncations=0,termination='declared_done')
+                    observation_truncations=0,termination='execute_budget' if i==0 else 'declared_done',
+                    execute_budget_triggered=(i==0), execute_seconds=80 if i==0 else i,
+                    episode_id=f'episode-{i}')
                 samples.append(s)
             with patch.dict(os.environ,APPWORLD_GRPO_CONFIG=str(self.config(directory))):
                 self.assertFalse(log_rollout_data(0,None,samples,{},1))
             row=json.loads((Path(directory)/'project_metrics/00000000.json').read_text())
             self.assertEqual(row['metrics']['appworld/mixed_group_rate'],1)
             self.assertEqual(row['metrics']['appworld/success_rate'],.25)
+            self.assertEqual(row['metrics']['appworld/execute_budget_trigger_rate'],.25)
+            self.assertEqual(row['metrics']['appworld/slow_trajectory_count_ge_60s'],1)
+            self.assertEqual(row['metrics']['appworld/timing/execute_total_p95_seconds'],80)
+            self.assertEqual(row['slowest_trajectories'][0]['episode_id'],'episode-0')
 
     def test_extractor_does_not_strip_internal_marker_or_repair_invalid_python(self):
         from run_agent import extract_code
@@ -188,7 +229,7 @@ class TrackingTests(unittest.TestCase):
             class Acc:
                 def __init__(self,*args,**kwargs): pass
                 def Reload(self): pass
-                def Tags(self): return dict(scalars=['train/loss'])
+                def Tags(self): return dict(scalars=['train/loss', 'perf/train_wait_time', 'perf/wait_time_ratio'])
                 def Scalars(self,tag): return [SimpleNamespace(step=0,wall_time=1,value=.4)]
             logged=[]
             bridge=SwanLabBridge.__new__(SwanLabBridge)
@@ -196,7 +237,9 @@ class TrackingTests(unittest.TestCase):
             bridge.event_class=Acc
             bridge.swanlab=SimpleNamespace(log=lambda data,step:logged.append((data,step)))
             bridge.poll();bridge.poll()
-            self.assertEqual(len(logged),2)
+            self.assertEqual(len(logged),4)
+            self.assertIn(({'slime/perf/train_wait_time':.4},0),logged)
+            self.assertIn(({'slime/perf/wait_time_ratio':.4},0),logged)
             self.assertIn(({'slime/train/loss':.4},0),logged)
 
 

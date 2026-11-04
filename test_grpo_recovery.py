@@ -14,9 +14,13 @@ from test_grpo import GRPOTests, Worker, ChatTokenizer
 class RecoveryTests(unittest.TestCase):
     def run_case(self, mode):
         with tempfile.TemporaryDirectory() as directory:
+            clock = SimpleNamespace(seconds=0)
+
             class Flaky(Worker):
                 attempts = 0
                 def call(self, command, **kwargs):
+                    if command == 'execute':
+                        clock.seconds += 2
                     if command == 'execute' and 'complete_task' in kwargs['code']:
                         Flaky.attempts += 1
                         if mode == 'exhaust' or Flaky.attempts == 1:
@@ -39,7 +43,10 @@ class RecoveryTests(unittest.TestCase):
                 return dict(text=code, meta_info=dict(finish_reason=dict(type='stop'),
                     output_token_logprobs=[[-.5,t,None] for t in (code+'!').encode()]))
             cfg = GRPOTests().config(directory)
-            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)):
+            if mode == 'replay_budget':
+                cfg.write_text(json.dumps(dict(json.loads(cfg.read_text()), env_execute_budget_seconds=5)))
+            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)), \
+                 patch('appworld_grpo.time', SimpleNamespace(monotonic=lambda: clock.seconds)):
                 operation = run_episode(SimpleNamespace(sglang_router_ip='x', sglang_router_port=1),
                     GRPOTests().sample(), {}, ChatTokenizer(), post, Flaky)
                 if mode == 'recover':
@@ -55,12 +62,17 @@ class RecoveryTests(unittest.TestCase):
             self.assertIn('timeout', [e['event'] for e in events])
             self.assertEqual(events[-1]['event'], 'episode_closed')
             self.assertEqual(len(generated), 2)  # recovery never resamples policy tokens
-            if mode in ('instruction_changed', 'supervisor_changed', 'diverge'):
+            if mode == 'replay_budget':
+                self.assertIn('execute_budget_during_replay', [e['event'] for e in events])
+                self.assertNotIn('episode_complete', [e['event'] for e in events])
+                self.assertEqual(Flaky.attempts, 1)
+            if mode in ('instruction_changed', 'supervisor_changed', 'diverge', 'replay_budget'):
                 self.assertIn('recovery_failed', [e['event'] for e in events])
             if mode != 'recover':
                 self.assertIn('episode_error', [e['event'] for e in events])
             self.assertTrue(Worker.instances[-1].closed)
 
+    def test_replay_counts_toward_budget_without_fake_reward(self): self.run_case('replay_budget')
     def test_changed_instruction_rejected(self): self.run_case('instruction_changed')
     def test_changed_supervisor_rejected(self): self.run_case('supervisor_changed')
 

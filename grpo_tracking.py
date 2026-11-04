@@ -107,6 +107,9 @@ class SwanLabBridge:
         if not hasattr(self, 'journal_offsets'):
             self.journal_offsets, self.journal_counts, self.journal_step = {}, {}, 0
         changed = False
+        tracked = ('timeout', 'recovery_ready', 'recovery_failed', 'episode_error',
+                   'episode_complete', 'execute_budget_reached',
+                   'execute_budget_during_timeout', 'execute_budget_during_replay')
         for path in (self.root/'episodes').glob('*.jsonl'):
             with path.open() as stream:
                 stream.seek(self.journal_offsets.get(str(path), 0))
@@ -117,15 +120,13 @@ class SwanLabBridge:
                         stream.seek(offset)
                         break
                     event = json.loads(line)['event']
-                    if event in ('timeout', 'recovery_ready', 'recovery_failed',
-                                 'episode_error', 'episode_complete'):
+                    if event in tracked:
                         self.journal_counts[event] = self.journal_counts.get(event, 0)+1
                         changed = True
                 self.journal_offsets[str(path)] = stream.tell()
         if changed:
             self.swanlab.log({'environment_events/'+key: self.journal_counts.get(key, 0)
-                for key in ('timeout', 'recovery_ready', 'recovery_failed',
-                            'episode_error', 'episode_complete')}, step=self.journal_step)
+                for key in tracked}, step=self.journal_step)
             self.journal_step += 1
 
     def sync_files(self, force=False):
