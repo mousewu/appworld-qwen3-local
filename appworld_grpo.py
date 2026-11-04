@@ -244,6 +244,9 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
             summary=sample.metadata['appworld'], turns=turns), ensure_ascii=False))
         record('episode_complete', reward=sample.reward, summary=sample.metadata['appworld'])
         return sample
+    except asyncio.CancelledError:
+        record('episode_cancelled', timings=dict(timings))
+        raise
     except BaseException as exc:
         record('episode_error', error=repr(exc), timings=dict(timings), timeout_recoveries=recoveries)
         raise

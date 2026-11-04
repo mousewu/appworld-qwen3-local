@@ -322,3 +322,47 @@ python -c "from slime_runtime import find_async_training_script; print(find_asyn
 Entry-file detection is a capability check. Inspect the installed collector
 and run a short smoke test to validate group retention and policy age before
 selecting `ASYNC_IMPLEMENTATION=fully`.
+
+### Project-owned continuous group queue
+
+```bash
+SWANLAB_MODE=cloud MAX_ENVS=24 UPDATES=12 bash run_grpo_async_queued.sh
+```
+
+This profile uses two actor GPUs (TP2) and two rollout GPUs (TP1). It selects
+native Slime `train.py` with the project rollout hook and a weight sync after
+every actor update. The hook uses Slime's persistent asyncio runner and
+sampling configuration, with the project's AppWorld trajectory and reward
+logic. The rollout output contains exactly the requested number of whole
+four-trajectory groups. Groups that finish before their peers can be consumed
+first. Extra completed groups stay queued for the next call.
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `ASYNC_GROUP_CAPACITY` | 16 | Total reserved, running and completed groups outside the batch being collected |
+| `ASYNC_INFLIGHT_GROUPS` | 8 | Maximum concurrently generating groups |
+| `ASYNC_MAX_POLICY_LAG` | 2 | Maximum actor updates elapsed since a group started |
+| `ASYNC_GROUP_RETRIES` | 3 | Maximum whole-group retries for stale or aborted attempts |
+| `ENV_EXECUTE_BUDGET_SECONDS` | 300 | Cumulative environment execution budget per trajectory |
+| `MAX_ENVS` | 24 | Maximum simultaneous AppWorld trajectories |
+
+Lag is a conservative upper bound based on the rollout ID at group start.
+The native driver must finish publishing weights before calling the next
+consecutive rollout. A group's later turns can already use newer weights,
+but the oldest possible policy determines eligibility. TIS still uses sampled
+token log probabilities. Stale groups regenerate from the same original
+prompts with fresh worlds. Aborts during actor training defer retry until the
+next collection, after weight publication. Retry exhaustion and infrastructure
+errors propagate to the launcher.
+
+SwanLab receives `slime/async/*` for lag, pending/ready/active group counts and
+cumulative stale/abort resampling counts through the existing TensorBoard
+bridge. Compare these with `slime/perf/train_wait_time`,
+`slime/perf/wait_time_ratio`, and the environment execution metrics. Prefetch
+reservations are in memory, so a checkpoint stores the advanced Slime data
+cursor without the prefetched groups. The last update closes the producer
+and cancels outstanding work.
+
+This mode expects Slime's `--rollout-function-path`,
+`RolloutFnTrainOutput` and persistent `slime.utils.async_utils.run` interfaces.
+The project hook leaves the Slime checkout untouched.

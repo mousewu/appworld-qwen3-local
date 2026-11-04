@@ -25,7 +25,7 @@ def arguments(implementation='pipeline'):
 class AsyncTests(unittest.TestCase):
     def test_disjoint_gpu_topology_pipeline_and_fully_flags(self):
         cfg=dict(model_type='qwen3',hidden_size=2560,rope_theta=5000000,max_position_embeddings=262144)
-        for mode in ['pipeline','fully']:
+        for mode in ['pipeline','fully','project']:
             args=training_args(arguments(mode),Path('/data'),Path('/out'),cfg)
             self.assertNotIn('--colocate',args)
             self.assertEqual(args[args.index('--actor-num-gpus-per-node')+1],'2')
@@ -33,8 +33,11 @@ class AsyncTests(unittest.TestCase):
             self.assertEqual(args[args.index('--rollout-num-gpus-per-engine')+1],'1')
             self.assertIn('--use-tis',args)
             self.assertIn('--use-dynamic-batch-size',args)
-            self.assertEqual('--update-weights-interval' in args,mode=='pipeline')
-            self.assertEqual('--rollout-function-path' in args,mode=='fully')
+            self.assertEqual('--update-weights-interval' in args,mode in ('pipeline','project'))
+            self.assertEqual('--rollout-function-path' in args,mode in ('fully','project'))
+            if mode == 'project':
+                self.assertEqual(args[args.index('--rollout-function-path')+1],
+                                 'appworld_async_rollout.generate_rollout')
 
     def test_native_async_entry_selection(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -42,6 +45,8 @@ class AsyncTests(unittest.TestCase):
             (root/'train.py').touch();(root/'train_async.py').touch()
             script,mode=find_async_training_script('auto',{'SLIME_DIR':directory})
             self.assertEqual(script.name,'train_async.py');self.assertEqual(mode,'pipeline')
+            script,mode=find_async_training_script('project',{'SLIME_DIR':directory})
+            self.assertEqual(script.name,'train.py');self.assertEqual(mode,'project')
             (root/'train_async.py').unlink()
             (root/'slime/rollout').mkdir(parents=True)
             (root/'slime/rollout/fully_async_rollout.py').touch()

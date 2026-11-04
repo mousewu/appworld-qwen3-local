@@ -63,8 +63,10 @@ def training_args(a, prompt_file, output, model_config):
         args += ['--use-tis','--tis-clip', '2.0', '--tis-clip-low','0.0',
                  '--sglang-server-concurrency',str(a.server_concurrency),
                  '--use-dynamic-batch-size','--max-tokens-per-gpu',str(a.train_max_tokens)]
-        if a.async_implementation == 'pipeline':
+        if a.async_implementation in ('pipeline', 'project'):
             args += ['--update-weights-interval','1']
+        if a.async_implementation == 'project':
+            args += ['--rollout-function-path', 'appworld_async_rollout.generate_rollout']
         if a.async_implementation == 'fully':
             args += ['--rollout-function-path',
                      'slime.rollout.fully_async_rollout.generate_rollout_fully_async']
@@ -84,7 +86,11 @@ def main():
     p.add_argument('--appworld-root', required=True, type=Path)
     p.add_argument('--output-dir', required=True, type=Path)
     p.add_argument('--async-training', action='store_true')
-    p.add_argument('--async-implementation', choices=['auto','pipeline','fully'], default='auto')
+    p.add_argument('--async-implementation', choices=['auto','pipeline','fully','project'], default='auto')
+    p.add_argument('--async-group-capacity', type=int, default=16, help='Total pending, active and completed groups')
+    p.add_argument('--async-inflight-groups', type=int, default=8)
+    p.add_argument('--async-max-policy-lag', type=int, default=2, help='Maximum age in actor updates since group start')
+    p.add_argument('--async-group-retries', type=int, default=3, help='Whole-group retries for stale or aborted groups')
     p.add_argument('--actor-gpus', type=int, default=2)
     p.add_argument('--max-envs', type=int, default=24, help='Per-node active AppWorld processes cap')
     p.add_argument('--server-concurrency', type=int, default=16, help='Concurrent trajectories per serving engine')
@@ -145,6 +151,13 @@ def main():
         p.error('Context budget exceeds model config')
     if min(a.max_envs, a.server_concurrency, a.gpu_monitor_interval, a.train_max_tokens) <= 0 or not 0 <= a.gpu_util_target <= 100 or a.gpu_monitor_warmup < 0:
         p.error('Invalid concurrency/utilization monitoring settings')
+    if a.async_implementation == 'project':
+        if not a.async_training or (a.num_gpus, a.actor_gpus, a.tp_size, a.rollout_tp) != (4, 2, 2, 1):
+            p.error('Project async requires four GPUs: two actor TP2 and two rollout TP1')
+        if not 0 < a.async_inflight_groups <= a.async_group_capacity or a.async_group_capacity < a.tasks_per_batch:
+            p.error('Async capacity must cover one batch and the in-flight group limit')
+        if min(a.async_max_policy_lag, a.async_group_retries) < 0:
+            p.error('Async lag and retry limits must be nonnegative')
     if a.async_training:
         script, a.async_implementation = find_async_training_script(a.async_implementation)
     else:

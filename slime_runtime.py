@@ -34,6 +34,10 @@ def find_training_script(environ=None, module_origin=None):
 def find_async_training_script(implementation='auto', environ=None, module_origin=None):
     env = os.environ if environ is None else environ
     script = find_training_script(env, module_origin)
+    if implementation == 'project':
+        if script.name != 'train.py':
+            raise ValueError('Project async requires Slime train.py with one weight sync per update')
+        return script, 'project'
     legacy = script.parent / 'train_async.py'
     if implementation in ('auto', 'pipeline') and legacy.is_file():
         return legacy, 'pipeline'
