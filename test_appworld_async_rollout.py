@@ -130,3 +130,30 @@ class GroupQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids(groups), [1])
         self.assertEqual(attempts[1], 2)
         self.assertEqual(metrics['async/policy_lag_max'], 0)
+
+    async def test_exhausted_stale_group_reserves_slot_without_losing_other_groups(self):
+        release = asyncio.Event()
+        started = asyncio.Event()
+        attempts = Counter()
+
+        async def generate(group):
+            gid = ids([group])[0]
+            attempts[gid] += 1
+            if gid == 1 and attempts[gid] == 2:
+                started.set()
+                await release.wait()
+            return await complete(group)
+
+        queue = GroupQueue(Source(), generate, capacity=3, concurrency=3, max_lag=0, max_retries=0)
+        self.addAsyncCleanup(queue.close)
+        await asyncio.wait_for(queue.collect(0, 1), 1)
+        await wait_for_ready(queue, 3)
+        collecting = asyncio.create_task(queue.collect(1, 1))
+        await asyncio.wait_for(started.wait(), 1)
+        self.assertFalse(collecting.done())
+        release.set()
+        groups, metrics = await asyncio.wait_for(collecting, 1)
+        self.assertEqual(ids(groups), [1])
+        self.assertEqual(metrics['async/stale_protected_total'], 1)
+        self.assertEqual(metrics['async/policy_lag_max'], 0)
+        self.assertEqual(queue.size, 3)

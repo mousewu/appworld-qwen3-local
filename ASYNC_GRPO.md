@@ -342,7 +342,7 @@ first. Extra completed groups stay queued for the next call.
 | `ASYNC_GROUP_CAPACITY` | 16 | Total reserved, running and completed groups outside the batch being collected |
 | `ASYNC_INFLIGHT_GROUPS` | 8 | Maximum concurrently generating groups |
 | `ASYNC_MAX_POLICY_LAG` | 2 | Maximum actor updates elapsed since a group started |
-| `ASYNC_GROUP_RETRIES` | 3 | Maximum whole-group retries for stale or aborted attempts |
+| `ASYNC_GROUP_RETRIES` | 3 | Ordinary stale retries and a separate abort retry limit per group |
 | `ENV_EXECUTE_BUDGET_SECONDS` | 300 | Cumulative environment execution budget per trajectory |
 | `MAX_ENVS` | 24 | Maximum simultaneous AppWorld trajectories |
 
@@ -352,11 +352,15 @@ consecutive rollout. A group's later turns can already use newer weights,
 but the oldest possible policy determines eligibility. TIS still uses sampled
 token log probabilities. Stale groups regenerate from the same original
 prompts with fresh worlds. Aborts during actor training defer retry until the
-next collection, after weight publication. Retry exhaustion and infrastructure
-errors propagate to the launcher.
+next collection, after weight publication. After ordinary stale retries are
+exhausted, the collector reserves a seat in its current batch for a fresh
+attempt of that group. This can increase the current batch's wait time but
+prevents a slow group from aging out repeatedly. One group gets this treatment
+at a time. Abort retry exhaustion and infrastructure errors still propagate
+to the launcher.
 
 SwanLab receives `slime/async/*` for lag, pending/ready/active group counts and
-cumulative stale/abort resampling counts through the existing TensorBoard
+cumulative stale/abort resampling counts and `stale_protected_total` through the existing TensorBoard
 bridge. Compare these with `slime/perf/train_wait_time`,
 `slime/perf/wait_time_ratio`, and the environment execution metrics. Prefetch
 reservations are in memory, so a checkpoint stores the advanced Slime data

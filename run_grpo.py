@@ -90,7 +90,7 @@ def main():
     p.add_argument('--async-group-capacity', type=int, default=16, help='Total pending, active and completed groups')
     p.add_argument('--async-inflight-groups', type=int, default=8)
     p.add_argument('--async-max-policy-lag', type=int, default=2, help='Maximum age in actor updates since group start')
-    p.add_argument('--async-group-retries', type=int, default=3, help='Whole-group retries for stale or aborted groups')
+    p.add_argument('--async-group-retries', type=int, default=3, help='Ordinary stale retries and separate abort retry limit per group')
     p.add_argument('--actor-gpus', type=int, default=2)
     p.add_argument('--max-envs', type=int, default=24, help='Per-node active AppWorld processes cap')
     p.add_argument('--server-concurrency', type=int, default=16, help='Concurrent trajectories per serving engine')

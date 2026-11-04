@@ -10,7 +10,8 @@ from appworld_grpo import config, generate
 @dataclass
 class Work:
     original: list
-    retries: int = 0
+    stale_retries: int = 0
+    abort_retries: int = 0
 
 
 class GroupQueue:
@@ -29,6 +30,7 @@ class GroupQueue:
         self.epoch = None
         self.closed = False
         self.collecting = False
+        self.protected = None
         self.error = None
         self.counts = Counter()
 
@@ -36,15 +38,14 @@ class GroupQueue:
     def size(self):
         return len(self.pending) + len(self.deferred) + len(self.active) + len(self.ready)
 
-    def _retry(self, work, reason):
-        if work.retries >= self.max_retries:
+    def _retry_abort(self, work):
+        if work.abort_retries >= self.max_retries:
             raise RuntimeError(f'AppWorld async group {work.original[0].group_index} '
-                               f'exhausted retries after {reason}')
-        work.retries += 1
-        self.counts[reason] += 1
-        # Weight updates can abort requests while the actor is training.
-        # Retry then only after train.py has finished publishing the next weights.
-        queue = self.deferred if reason == 'aborted_resampled' and not self.collecting else self.pending
+                               'exhausted retries after aborted_resampled')
+        work.abort_retries += 1
+        self.counts['aborted_resampled'] += 1
+        # Background aborts can be caused by a weight publication in progress.
+        queue = self.pending if self.collecting else self.deferred
         queue.appendleft(work)
 
     def _fill_slots(self):
@@ -66,11 +67,12 @@ class GroupQueue:
             if len(group) != 4:
                 raise ValueError('AppWorld async requires exactly four trajectories per group')
             if any(s.status == s.Status.ABORTED for s in group):
-                self._retry(work, 'aborted_resampled')
+                self._retry_abort(work)
             else:
                 if any(s.status != s.Status.COMPLETED or s.reward not in (0.0, 1.0) for s in group):
                     raise ValueError('AppWorld async received an incomplete or unscored trajectory')
-                self.ready.append((work, epoch, group))
+                enqueue = self.ready.appendleft if work is self.protected else self.ready.append
+                enqueue((work, epoch, group))
         except (Exception, asyncio.CancelledError) as exc:
             self.error = exc
         self._fill_slots()
@@ -91,13 +93,29 @@ class GroupQueue:
             if self.error is not None:
                 raise self.error
             while self.ready and len(groups) < target:
-                work, started, group = self.ready.popleft()
+                work, started, group = self.ready[0]
+                if self.protected is not None and work is not self.protected and len(groups) == target-1:
+                    break  # Keep the last seat open for the protected group's fresh attempt.
                 age = epoch - started
+                if age > self.max_lag and work.stale_retries >= self.max_retries and self.protected is not None:
+                    break  # Only one protected attempt at a time.
+                self.ready.popleft()
                 if age > self.max_lag:
-                    self._retry(work, 'stale_resampled')
+                    if work.stale_retries >= self.max_retries:
+                        self.protected = work
+                        self.counts['stale_protected'] += 1
+                    else:
+                        work.stale_retries += 1
+                        self.counts['stale_resampled'] += 1
+                    if self.protected is not None and work is not self.protected:
+                        self.pending.append(work)
+                    else:
+                        self.pending.appendleft(work)
                 else:
                     groups.append(group)
                     ages.append(age)
+                    if work is self.protected:
+                        self.protected = None
             remaining = target - len(groups)
             # Only the consumer advances Slime's data source. During actor
             # training callbacks use already reserved prompts, so a concurrent
@@ -119,6 +137,7 @@ class GroupQueue:
             'async/ready_groups': len(self.ready),
             'async/pending_groups': len(self.pending) + len(self.deferred),
             'async/active_groups': len(self.active),
+            'async/stale_protected_total': self.counts['stale_protected'],
             'async/stale_resampled_total': self.counts['stale_resampled'],
             'async/aborted_resampled_total': self.counts['aborted_resampled'],
         }
