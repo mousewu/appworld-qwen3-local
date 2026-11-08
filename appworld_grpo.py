@@ -51,6 +51,7 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
         sample.weight_versions = []
     worker = worker_factory(cfg['appworld_python'], cfg['appworld_root'], cfg['env_timeout'])
     tokens, mask, log_probs, turns = [], [], [], []
+    action_end_positions = []
     reason = 'step_limit'
     started = time.monotonic()
     timings = Counter()
@@ -168,6 +169,10 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
             if not ids or len(tokens)+len(ids) > cfg['context_length']:
                 raise ValueError('Empty generation or response exceeds context budget')
             append_segment(tokens, mask, log_probs, ids, True, values)
+            # TB-GAE discounts only when control passes from an action to the
+            # environment.  Keep response-space boundaries here instead of
+            # trying to recover them later from decoded text.
+            action_end_positions.append(len(mask)-1)
             version = output['meta_info'].get('weight_version')
             if version is not None:
                 if not hasattr(sample, 'weight_versions'):
@@ -229,13 +234,24 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
         sample.reward = float(evaluation['success'] is True)
         # Limits are valid scored outcomes; do not let generic truncation filtering discard failures.
         sample.status = sample.Status.COMPLETED
-        sample.metadata = dict(sample.metadata, appworld=dict(termination=reason, steps=len(turns),
+        appworld_metadata = dict(termination=reason, steps=len(turns),
             episode_id=episode_id, execute_budget_triggered=budget_triggered,
             execute_seconds=execute_seconds(), timeout_recoveries=recoveries, timings=dict(timings),
+            evaluation=dict(evaluation), family_id=task_id.rsplit('_', 1)[0],
             episode_seconds=time.monotonic()-started,
             format_errors=sum(t['feedback_kind']=='format_error' for t in turns),
             execution_errors=sum(t['feedback_kind']=='execution_error' for t in turns),
-            observation_truncations=sum(t.get('observation_truncated', False) for t in turns)))
+            observation_truncations=sum(t.get('observation_truncated', False) for t in turns))
+        sample.metadata = dict(sample.metadata, appworld=appworld_metadata)
+        if cfg.get('enable_tb_gae'):
+            turn_end_mask = [0] * len(mask)
+            for position in action_end_positions:
+                turn_end_mask[position] = 1
+            is_real_done = [0] * len(mask)
+            is_real_done[max(index for index, active in enumerate(mask) if active)] = 1
+            sample.metadata.update(turn_end_mask=turn_end_mask, is_real_done=is_real_done,
+                tb_boundary=dict(episode=episode_id, chunk_index=0, chunk_count=1,
+                                 terminal=True, bootstrap_token_ids=None))
         assert len(tokens)-len(initial) == len(mask) == len(log_probs)
         path = Path(cfg['output_dir'])/'episodes'/f'{episode_id}.json'
         path.parent.mkdir(parents=True, exist_ok=True)

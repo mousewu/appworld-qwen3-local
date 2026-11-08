@@ -144,6 +144,7 @@ class SwanLabBridge:
         # Explicit allowlist: never upload model weights, arbitrary files, or credentials.
         paths = [self.root/name for name in ['training.log', 'project_config.json',
                  'command.json', 'train_tasks.jsonl', 'run_status.json',
+                 'reward_scales.json', 'rpr_roles.yaml', 'rpr_task_config.yaml',
                  'gpu_utilization.jsonl', 'gpu_summary.json', 'resource_usage.jsonl',
                  'resource_summary.json', 'resource_monitor_error.json', 'exit_diagnosis.json']]
         paths += list((self.root/'episodes').glob('*.json'))
