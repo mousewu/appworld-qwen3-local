@@ -3,8 +3,11 @@ import asyncio
 from collections import Counter, deque
 from copy import deepcopy
 from dataclasses import dataclass
+import logging
 
 from appworld_grpo import config, generate
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,6 +36,7 @@ class GroupQueue:
         self.protected = None
         self.error = None
         self.counts = Counter()
+        self.skips_since_progress = 0
 
     @property
     def size(self):
@@ -40,8 +44,17 @@ class GroupQueue:
 
     def _retry_abort(self, work):
         if work.abort_retries >= self.max_retries:
-            raise RuntimeError(f'AppWorld async group {work.original[0].group_index} '
-                               'exhausted retries after aborted_resampled')
+            self.counts['aborted_skipped'] += 1
+            self.skips_since_progress += 1
+            sample = work.original[0]
+            logger.warning('Skipping exhausted abort group: group_index=%s task_id=%s retries=%s',
+                           sample.group_index, sample.metadata.get('task_id'), work.abort_retries)
+            if work is self.protected:
+                self.protected = None
+            if self.skips_since_progress > self.capacity:
+                raise RuntimeError('AppWorld async exceeded one queue capacity of exhausted abort groups '
+                                   'without accepting a complete group')
+            return
         work.abort_retries += 1
         self.counts['aborted_resampled'] += 1
         # Background aborts can be caused by a weight publication in progress.
@@ -114,6 +127,8 @@ class GroupQueue:
                 else:
                     groups.append(group)
                     ages.append(age)
+                    self.skips_since_progress = 0
+                    self.counts['accepted'] += 1
                     if work is self.protected:
                         self.protected = None
             remaining = target - len(groups)
@@ -140,6 +155,9 @@ class GroupQueue:
             'async/stale_protected_total': self.counts['stale_protected'],
             'async/stale_resampled_total': self.counts['stale_resampled'],
             'async/aborted_resampled_total': self.counts['aborted_resampled'],
+            'async/aborted_skipped_total': self.counts['aborted_skipped'],
+            'async/aborted_skipped_rate': self.counts['aborted_skipped'] /
+                (self.counts['aborted_skipped'] + self.counts['accepted']),
         }
         self.collecting = False
         if final:

@@ -1,4 +1,5 @@
 """Project-local multi-turn generation and metric hooks for Slime GRPO."""
+import ast
 import asyncio
 from collections import Counter, defaultdict
 import json
@@ -57,6 +58,8 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
     timings = Counter()
     execute_budget = cfg.get('env_execute_budget_seconds', 0)
     budget_triggered = False
+    repeat_limit = cfg.get("repeated_execution_error_limit", 2)
+    repeated_errors = Counter()
 
     def execute_seconds():
         return timings['execute'] + timings['replay_execute']
@@ -185,6 +188,7 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                 break  # Never submit a potentially incomplete code block.
             if finish != 'stop':
                 raise ValueError(f'Unsupported SGLang finish reason: {finish}')
+            repeat_triggered = False
             try:
                 code = extract_code(raw)
             except (ValueError, SyntaxError) as exc:
@@ -195,6 +199,16 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                 observation, failed = execution_feedback(result['observation'])
                 done = result['declared_done']
                 kind = 'execution_error' if failed else 'execution_output'
+                if repeat_limit and failed and not done:
+                    # Ignore traceback locations and code formatting. Other actions,
+                    # such as looking up API docs, do not erase a failed action.
+                    error = result['observation'].strip().splitlines()[-1].strip()
+                    key = (ast.dump(ast.parse(code), include_attributes=False), error)
+                    repeated_errors[key] += 1
+                    repeat_triggered = repeated_errors[key] >= repeat_limit
+                    if repeat_triggered:
+                        record('repeated_execution_error', turn=turn+1,
+                               occurrences=repeated_errors[key], error=error)
                 if execute_budget and execute_seconds() >= execute_budget:
                     budget_triggered = True
                     record('execute_budget_reached', turn=turn+1, seconds=execute_seconds(),
@@ -208,6 +222,9 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                 break
             if budget_triggered:
                 reason = 'execute_budget'
+                break
+            if repeat_triggered:
+                reason = 'repeated_execution_error'
                 break
             if turn+1 == cfg['max_steps']:
                 break
@@ -334,7 +351,7 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
                     execute_seconds=summary.get('execute_seconds', 0), termination=summary['termination'])
                for s, summary in sorted(summaries, key=lambda pair: pair[1].get('execute_seconds', 0),
                                         reverse=True)[:3]]
-    for reason in ['step_limit', 'generation_limit', 'declared_done', 'context_limit', 'execute_budget']:
+    for reason in ['step_limit', 'generation_limit', 'declared_done', 'context_limit', 'execute_budget', 'repeated_execution_error']:
         metrics['termination/'+reason] = 0
     for reason, count in Counter(s.metadata['appworld']['termination'] for s in flattened).items():
         metrics['termination/'+reason] = count

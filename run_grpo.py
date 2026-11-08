@@ -109,6 +109,8 @@ def main():
     p.add_argument('--observation-tokens', type=int, default=2048)
     p.add_argument('--env-timeout-retries', type=int, default=1,
                    help='Bounded fresh-world replay recoveries per episode; exhausted failures stop training')
+    p.add_argument('--repeated-execution-error-limit', type=int, default=2,
+                   help='Stop and evaluate after identical code and error recur this many times (0 disables)')
     p.add_argument('--env-timeout', type=float, default=120)
     p.add_argument('--env-execute-budget-seconds', type=float, default=0,
                    help='Cumulative execute/replay seconds per episode, checked after each call (0 disables)')
@@ -138,6 +140,8 @@ def main():
         p.error('Invalid rollout TP, observation/context budget or sampling temperature')
     if not math.isfinite(a.env_execute_budget_seconds) or a.env_execute_budget_seconds < 0:
         p.error('--env-execute-budget-seconds must be finite and nonnegative')
+    if a.repeated_execution_error_limit < 0:
+        p.error('--repeated-execution-error-limit must be nonnegative')
     if a.env_timeout_retries < 0:
         p.error('--env-timeout-retries must be nonnegative')
     if a.log_upload_interval <= 0:

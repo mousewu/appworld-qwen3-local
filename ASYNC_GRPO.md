@@ -356,8 +356,18 @@ next collection, after weight publication. After ordinary stale retries are
 exhausted, the collector reserves a seat in its current batch for a fresh
 attempt of that group. This can increase the current batch's wait time but
 prevents a slow group from aging out repeatedly. One group gets this treatment
-at a time. Abort retry exhaustion and infrastructure errors still propagate
-to the launcher.
+at a time. An abort group that exhausts its retries is skipped as a whole and replaced
+by another complete group. The warning includes the group index and task ID.
+SwanLab reports `slime/async/aborted_skipped_total` and
+`slime/async/aborted_skipped_rate` (skipped / (skipped + accepted)).
+More than one queue capacity of skipped groups without accepting a complete
+group stops collection. Infrastructure errors still propagate to the launcher.
+
+By default, executing identical Python code and receiving the same error
+twice in one trajectory ends the rollout with `repeated_execution_error`
+and evaluates its current world state. Intervening actions such as API
+documentation lookups do not reset the count. Set
+`--repeated-execution-error-limit 0` to disable the cutoff.
 
 SwanLab receives `slime/async/*` for lag, pending/ready/active group counts and
 cumulative stale/abort resampling counts and `stale_protected_total` through the existing TensorBoard

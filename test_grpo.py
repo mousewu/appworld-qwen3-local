@@ -185,6 +185,36 @@ class GRPOTests(unittest.TestCase):
             self.assertEqual([row['seconds'] for row in events
                               if row['event']=='env_end' and row['command']=='execute'], [2, 2])
 
+    def test_repeated_failed_action_across_documentation_lookup_ends_with_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = self.config(directory)
+            cfg.write_text(json.dumps(dict(json.loads(cfg.read_text()), max_steps=10)))
+            actions = iter(['for song in song_queue: show(song)', 'show_api_doc()',
+                            'for song in song_queue:\n    show(song)'])
+
+            class WorkerWithRequestLimit(Worker):
+                success = False
+
+                def call(self, command, **kwargs):
+                    result = super().call(command, **kwargs)
+                    if command == 'execute' and 'song_queue' in kwargs['code']:
+                        result['observation'] = ('Execution failed. Traceback:\n'
+                            'Exception: Number of requests exceeded the limit of 1000.')
+                    return result
+
+            async def post(*args):
+                return dict(text=next(actions), meta_info=dict(finish_reason=dict(type='stop'),
+                    output_token_logprobs=[[-.5,33,None]]))
+
+            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)):
+                result = asyncio.run(run_episode(SimpleNamespace(sglang_router_ip='x',
+                    sglang_router_port=1), self.sample(), {}, ChatTokenizer(), post, WorkerWithRequestLimit))
+            self.assertEqual(result.status, 'completed')
+            self.assertEqual(result.reward, 0)
+            self.assertEqual(result.metadata['appworld']['termination'], 'repeated_execution_error')
+            self.assertEqual(result.metadata['appworld']['steps'], 3)
+            self.assertEqual(Worker.instances[-1].calls[-1][0], 'evaluate')
+
     def test_group_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             samples=[]

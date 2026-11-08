@@ -18,7 +18,7 @@ class Source:
         gid = self.next_id
         self.next_id += 1
         return [[SimpleNamespace(group_index=gid, index=gid*4+i, status=None,
-                                 reward=None, Status=STATUS) for i in range(4)]]
+                                 reward=None, Status=STATUS, metadata={'task_id': str(gid)}) for i in range(4)]]
 
 
 async def complete(group):
@@ -157,3 +157,28 @@ class GroupQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics['async/stale_protected_total'], 1)
         self.assertEqual(metrics['async/policy_lag_max'], 0)
         self.assertEqual(queue.size, 3)
+
+    async def test_abort_exhaustion_replaces_entire_group(self):
+        async def generate(group):
+            await complete(group)
+            if ids([group]) == [0]:
+                group[0].status = STATUS.ABORTED
+            return group
+
+        queue = GroupQueue(Source(), generate, capacity=1, concurrency=1, max_lag=2, max_retries=1)
+        self.addAsyncCleanup(queue.close)
+        groups, metrics = await asyncio.wait_for(queue.collect(0, 1, final=True), 1)
+        self.assertEqual(ids(groups), [1])
+        self.assertEqual(len(groups[0]), 4)
+        self.assertEqual(metrics['async/aborted_resampled_total'], 1)
+        self.assertEqual(metrics['async/aborted_skipped_total'], 1)
+
+    async def test_systemic_abort_does_not_spin_forever(self):
+        async def generate(group):
+            group[0].status = STATUS.ABORTED
+            return group
+
+        queue = GroupQueue(Source(), generate, capacity=1, concurrency=1, max_lag=2, max_retries=0)
+        self.addAsyncCleanup(queue.close)
+        with self.assertRaisesRegex(RuntimeError, 'without accepting a complete group'):
+            await asyncio.wait_for(queue.collect(0, 1), 1)
