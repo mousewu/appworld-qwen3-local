@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import unittest
 
 from appworld_async_rollout import GroupQueue
+from appworld_grpo import ExecuteRecoveryExhaustedError
 
 
 STATUS = SimpleNamespace(COMPLETED='complete', ABORTED='aborted')
@@ -182,3 +183,40 @@ class GroupQueueTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(queue.close)
         with self.assertRaisesRegex(RuntimeError, 'without accepting a complete group'):
             await asyncio.wait_for(queue.collect(0, 1), 1)
+
+    async def test_exhausted_execute_timeout_replaces_whole_group(self):
+        async def generate(group):
+            if ids([group]) == [0]:
+                raise ExceptionGroup('TaskGroup', [ExecuteRecoveryExhaustedError('execute')])
+            return await complete(group)
+
+        queue = GroupQueue(Source(), generate, capacity=1, concurrency=1, max_lag=1, max_retries=1)
+        self.addAsyncCleanup(queue.close)
+        groups, metrics = await asyncio.wait_for(queue.collect(0, 1, final=True), 1)
+        self.assertEqual(ids(groups), [1])
+        self.assertEqual(len(groups[0]), 4)
+        self.assertEqual(metrics['async/execute_timeout_skipped_total'], 1)
+        self.assertEqual(metrics['async/execute_timeout_skipped_rate'], .5)
+        self.assertEqual(metrics['async/aborted_skipped_total'], 0)
+
+    async def test_consecutive_execute_timeout_groups_stop_collection(self):
+        async def generate(group):
+            raise ExecuteRecoveryExhaustedError('execute')
+
+        source = Source()
+        queue = GroupQueue(source, generate, capacity=1, concurrency=1, max_lag=1, max_retries=1,
+                           max_consecutive_timeouts=2)
+        self.addAsyncCleanup(queue.close)
+        with self.assertRaisesRegex(ExecuteRecoveryExhaustedError, '2 consecutive task groups'):
+            await asyncio.wait_for(queue.collect(0, 1), 1)
+        self.assertEqual(source.next_id, 2)
+
+    async def test_mixed_exception_group_propagates(self):
+        async def generate(group):
+            raise ExceptionGroup('mixed', [ExecuteRecoveryExhaustedError('execute'), ValueError('invalid')])
+
+        queue = GroupQueue(Source(), generate, capacity=1, concurrency=1, max_lag=1, max_retries=1)
+        self.addAsyncCleanup(queue.close)
+        with self.assertRaisesRegex(ExceptionGroup, 'mixed'):
+            await asyncio.wait_for(queue.collect(0, 1), 1)
+        self.assertEqual(queue.counts['execute_timeout_skipped'], 0)

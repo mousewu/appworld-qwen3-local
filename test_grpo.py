@@ -215,6 +215,35 @@ class GRPOTests(unittest.TestCase):
             self.assertEqual(result.metadata['appworld']['steps'], 3)
             self.assertEqual(Worker.instances[-1].calls[-1][0], 'evaluate')
 
+    def test_unbounded_retry_is_rejected_and_bounded_correction_executes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            loop = ("for album_id in album_ids:\n"
+                    "    while True:\n"
+                    "        try:\n"
+                    "            review_album(album_id)\n"
+                    "            break\n"
+                    "        except Exception as exc:\n"
+                    "            print(exc)")
+            corrected = loop.replace('while True:', 'for attempt in range(3):')
+            payloads = []
+
+            async def post(_, payload):
+                payloads.append(payload)
+                return dict(text=loop if len(payloads) == 1 else corrected,
+                            meta_info=dict(finish_reason=dict(type='stop'),
+                                           output_token_logprobs=[[-.5, 33, None]]))
+
+            cfg = self.config(directory)
+            cfg.write_text(json.dumps(dict(json.loads(cfg.read_text()), observation_tokens=512)))
+            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)):
+                sample = asyncio.run(run_episode(SimpleNamespace(sglang_router_ip='x',
+                    sglang_router_port=1), self.sample(), {}, ChatTokenizer(), post, Worker))
+            self.assertIn(b'CODE WAS NOT SUBMITTED', bytes(payloads[1]['input_ids']))
+            self.assertEqual(sample.metadata['appworld']['unbounded_retry_rejections'], 1)
+            calls = Worker.instances[-1].calls
+            self.assertTrue(all(args['code'] == corrected for cmd, args in calls if cmd == 'execute'))
+            self.assertEqual(sum(cmd == 'execute' for cmd, _ in calls), 2)
+
     def test_group_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             samples=[]

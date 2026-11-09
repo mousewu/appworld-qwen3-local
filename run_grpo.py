@@ -90,6 +90,8 @@ def main():
     p.add_argument('--async-group-capacity', type=int, default=16, help='Total pending, active and completed groups')
     p.add_argument('--async-inflight-groups', type=int, default=8)
     p.add_argument('--async-max-policy-lag', type=int, default=2, help='Maximum age in actor updates since group start')
+    p.add_argument('--async-max-consecutive-timeouts', type=int, default=3,
+                   help='Stop after this many exhausted execute timeout groups without a complete group')
     p.add_argument('--async-group-retries', type=int, default=3, help='Ordinary stale retries and separate abort retry limit per group')
     p.add_argument('--actor-gpus', type=int, default=2)
     p.add_argument('--max-envs', type=int, default=24, help='Per-node active AppWorld processes cap')
@@ -140,6 +142,8 @@ def main():
         p.error('Invalid rollout TP, observation/context budget or sampling temperature')
     if not math.isfinite(a.env_execute_budget_seconds) or a.env_execute_budget_seconds < 0:
         p.error('--env-execute-budget-seconds must be finite and nonnegative')
+    if a.async_max_consecutive_timeouts < 1:
+        p.error('--async-max-consecutive-timeouts must be positive')
     if a.repeated_execution_error_limit < 0:
         p.error('--repeated-execution-error-limit must be nonnegative')
     if a.env_timeout_retries < 0:

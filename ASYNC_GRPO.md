@@ -380,3 +380,18 @@ and cancels outstanding work.
 This mode expects Slime's `--rollout-function-path`,
 `RolloutFnTrainOutput` and persistent `slime.utils.async_utils.run` interfaces.
 The project hook leaves the Slime checkout untouched.
+
+The action validator rejects the direct unbounded retry pattern `while True`
+with a call followed by a success-only `break` and an exception handler
+that only prints, passes, or continues. Rejected code never reaches AppWorld.
+The trajectory receives corrective feedback and can submit a bounded retry
+on its next turn. `appworld/unbounded_retry_rejections` counts these actions.
+
+The project queue replaces an entire group when its `execute` RPC times out
+after exhausting the episode's recovery allowance. Only complete groups enter
+GRPO. SwanLab reports `slime/async/execute_timeout_skipped_total` and
+`slime/async/execute_timeout_skipped_rate` (timeout skips divided by accepted
+groups plus timeout and abort skips). By default three consecutive exhausted
+execute timeout groups without a fully completed group stop the run. Set
+`--async-max-consecutive-timeouts` to change that threshold. Reset/evaluation
+timeouts, other recovery errors, and mixed exception groups still propagate.

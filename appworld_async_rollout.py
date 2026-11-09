@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import logging
 
-from appworld_grpo import config, generate
+from appworld_grpo import ExecuteRecoveryExhaustedError, config, generate
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class Work:
 
 
 class GroupQueue:
-    def __init__(self, source, generate_group, *, capacity, concurrency, max_lag, max_retries):
+    def __init__(self, source, generate_group, *, capacity, concurrency, max_lag, max_retries, max_consecutive_timeouts=3):
         self.source = source
         self.generate_group = generate_group
         self.capacity = capacity
@@ -37,6 +37,8 @@ class GroupQueue:
         self.error = None
         self.counts = Counter()
         self.skips_since_progress = 0
+        self.consecutive_timeouts = 0
+        self.max_consecutive_timeouts = max_consecutive_timeouts
 
     @property
     def size(self):
@@ -84,10 +86,32 @@ class GroupQueue:
             else:
                 if any(s.status != s.Status.COMPLETED or s.reward not in (0.0, 1.0) for s in group):
                     raise ValueError('AppWorld async received an incomplete or unscored trajectory')
+                self.consecutive_timeouts = 0
                 enqueue = self.ready.appendleft if work is self.protected else self.ready.append
                 enqueue((work, epoch, group))
         except (Exception, asyncio.CancelledError) as exc:
-            self.error = exc
+            # TaskGroup wraps exceptions. Skip only if every leaf is an
+            # exhausted execute timeout; preserve mixed or unrelated errors.
+            if isinstance(exc, ExceptionGroup):
+                matched, remaining = exc.split(ExecuteRecoveryExhaustedError)
+                exhausted = matched is not None and remaining is None
+            else:
+                exhausted = isinstance(exc, ExecuteRecoveryExhaustedError)
+            if exhausted:
+                self.counts['execute_timeout_skipped'] += 1
+                self.consecutive_timeouts += 1
+                sample = work.original[0]
+                logger.warning('Skipping execute timeout group: group_index=%s task_id=%s consecutive=%s',
+                               sample.group_index, sample.metadata.get('task_id'), self.consecutive_timeouts)
+                if work is self.protected:
+                    self.protected = None
+                if self.consecutive_timeouts >= self.max_consecutive_timeouts:
+                    self.error = ExecuteRecoveryExhaustedError(
+                        f'AppWorld timeout recovery budget exhausted for {self.consecutive_timeouts} '
+                        f'consecutive task groups; last failure: {exc}')
+                    self.error.__cause__ = exc
+            else:
+                self.error = exc
         self._fill_slots()
         self.changed.set()
 
@@ -146,6 +170,8 @@ class GroupQueue:
             self._fill_slots()
             await self.changed.wait()
 
+        resolved = (self.counts['accepted'] + self.counts['aborted_skipped']
+                    + self.counts['execute_timeout_skipped'])
         metrics = {
             'async/policy_lag_max': max(ages),
             'async/policy_lag_mean': sum(ages) / len(ages),
@@ -155,6 +181,8 @@ class GroupQueue:
             'async/stale_protected_total': self.counts['stale_protected'],
             'async/stale_resampled_total': self.counts['stale_resampled'],
             'async/aborted_resampled_total': self.counts['aborted_resampled'],
+            'async/execute_timeout_skipped_total': self.counts['execute_timeout_skipped'],
+            'async/execute_timeout_skipped_rate': self.counts['execute_timeout_skipped'] / resolved,
             'async/aborted_skipped_total': self.counts['aborted_skipped'],
             'async/aborted_skipped_rate': self.counts['aborted_skipped'] /
                 (self.counts['aborted_skipped'] + self.counts['accepted']),
@@ -196,7 +224,8 @@ async def _collect(args, rollout_id, data_source):
 
         _queue = GroupQueue(data_source, generate_group, capacity=cfg['async_group_capacity'],
                             concurrency=cfg['async_inflight_groups'], max_lag=cfg['async_max_policy_lag'],
-                            max_retries=cfg['async_group_retries'])
+                            max_retries=cfg['async_group_retries'],
+                            max_consecutive_timeouts=cfg.get('async_max_consecutive_timeouts', 3))
     try:
         final = rollout_id == args.num_rollout - 1
         groups, metrics = await _queue.collect(rollout_id, args.rollout_batch_size, final=final)

@@ -19,6 +19,32 @@ def config():
     return json.loads(Path(os.environ['APPWORLD_GRPO_CONFIG']).read_text())
 
 
+class ExecuteRecoveryExhaustedError(TimeoutError):
+    """An execute RPC still timed out after its recovery allowance was used."""
+
+
+def has_unbounded_exception_retry(tree):
+    """Detect a direct call retried forever by a print/pass/continue handler."""
+    for loop in ast.walk(tree):
+        if not (isinstance(loop, ast.While) and isinstance(loop.test, ast.Constant)
+                and loop.test.value is True and len(loop.body) == 1):
+            continue
+        attempt = loop.body[0]
+        if not isinstance(attempt, ast.Try) or attempt.finalbody or len(attempt.body) != 2:
+            continue
+        operation, success = attempt.body
+        if not (isinstance(operation, (ast.Expr, ast.Assign))
+                and isinstance(operation.value, ast.Call) and isinstance(success, ast.Break)):
+            continue
+        for handler in attempt.handlers:
+            if all(isinstance(stmt, (ast.Pass, ast.Continue)) or
+                   (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                    and isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == 'print')
+                   for stmt in handler.body):
+                return True
+    return False
+
+
 def task_identity(reset_result):
     """Prompt-defining fields only; runtime contains changing experiment paths.
 
@@ -104,7 +130,8 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                     raise TimeoutError('AppWorld execute timed out after cumulative execution budget; inspect '+str(journal)) from exc
                 if recoveries >= cfg.get('env_timeout_retries', 1):
                     # Unknown infrastructure failures must never silently become reward zero.
-                    raise TimeoutError('AppWorld timeout recovery budget exhausted; inspect '+str(journal)) from exc
+                    error_type = ExecuteRecoveryExhaustedError if command == 'execute' else TimeoutError
+                    raise error_type('AppWorld timeout recovery budget exhausted; inspect '+str(journal)) from exc
                 recoveries += 1
                 recovery_start = time.monotonic()
                 await asyncio.to_thread(worker.close)
@@ -191,28 +218,36 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
             repeat_triggered = False
             try:
                 code = extract_code(raw)
+                tree = ast.parse(code)
             except (ValueError, SyntaxError) as exc:
                 observation, done, kind = format_error_feedback(exc), False, 'format_error'
             else:
-                result = await env_call('execute', code=code)
-                history.append((code, result))
-                observation, failed = execution_feedback(result['observation'])
-                done = result['declared_done']
-                kind = 'execution_error' if failed else 'execution_output'
-                if repeat_limit and failed and not done:
-                    # Ignore traceback locations and code formatting. Other actions,
-                    # such as looking up API docs, do not erase a failed action.
-                    error = result['observation'].strip().splitlines()[-1].strip()
-                    key = (ast.dump(ast.parse(code), include_attributes=False), error)
-                    repeated_errors[key] += 1
-                    repeat_triggered = repeated_errors[key] >= repeat_limit
-                    if repeat_triggered:
-                        record('repeated_execution_error', turn=turn+1,
-                               occurrences=repeated_errors[key], error=error)
-                if execute_budget and execute_seconds() >= execute_budget:
-                    budget_triggered = True
-                    record('execute_budget_reached', turn=turn+1, seconds=execute_seconds(),
-                           budget_seconds=execute_budget)
+                if has_unbounded_exception_retry(tree):
+                    observation = ('[APPWORLD ACTION REJECTED — CODE WAS NOT SUBMITTED]\n'
+                                   'The while True loop retries a failing call indefinitely. '
+                                   'Use a fixed retry limit, or log the failure and continue '
+                                   'with the next item. Return corrected Python.')
+                    done, kind = False, 'unbounded_retry_rejected'
+                else:
+                    result = await env_call('execute', code=code)
+                    history.append((code, result))
+                    observation, failed = execution_feedback(result['observation'])
+                    done = result['declared_done']
+                    kind = 'execution_error' if failed else 'execution_output'
+                    if repeat_limit and failed and not done:
+                        # Ignore traceback locations and code formatting. Other actions,
+                        # such as looking up API docs, do not erase a failed action.
+                        error = result['observation'].strip().splitlines()[-1].strip()
+                        key = (ast.dump(tree, include_attributes=False), error)
+                        repeated_errors[key] += 1
+                        repeat_triggered = repeated_errors[key] >= repeat_limit
+                        if repeat_triggered:
+                            record('repeated_execution_error', turn=turn+1,
+                                   occurrences=repeated_errors[key], error=error)
+                    if execute_budget and execute_seconds() >= execute_budget:
+                        budget_triggered = True
+                        record('execute_budget_reached', turn=turn+1, seconds=execute_seconds(),
+                               budget_seconds=execute_budget)
             observation, clipped = bound_observation(tokenizer, observation, cfg['observation_tokens'])
             turns.append(dict(turn=turn+1, raw_completion=raw, observation=observation,
                               feedback_kind=kind, observation_truncated=clipped))
@@ -258,6 +293,7 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
             episode_seconds=time.monotonic()-started,
             format_errors=sum(t['feedback_kind']=='format_error' for t in turns),
             execution_errors=sum(t['feedback_kind']=='execution_error' for t in turns),
+            unbounded_retry_rejections=sum(t['feedback_kind']=='unbounded_retry_rejected' for t in turns),
             observation_truncations=sum(t.get('observation_truncated', False) for t in turns))
         sample.metadata = dict(sample.metadata, appworld=appworld_metadata)
         if cfg.get('enable_tb_gae'):
@@ -339,6 +375,8 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
         metrics['timing/'+stage+'_max_seconds'] = max(values)
     metrics['timeout_recoveries'] = sum(s.metadata['appworld'].get('timeout_recoveries', 0) for s in flattened)
     summaries = [(s, s.metadata['appworld']) for s in flattened]
+    metrics['unbounded_retry_rejections'] = sum(summary.get('unbounded_retry_rejections', 0)
+                                                for _, summary in summaries)
     execute_times = sorted(summary.get('execute_seconds', 0) for _, summary in summaries)
     metrics['timing/execute_total_p95_seconds'] = execute_times[math.ceil(.95*len(execute_times))-1]
     metrics['timing/execute_total_max_seconds'] = execute_times[-1]

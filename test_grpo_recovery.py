@@ -7,7 +7,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from appworld_grpo import run_episode, task_identity
+from appworld_grpo import run_episode, task_identity, ExecuteRecoveryExhaustedError
 from test_grpo import GRPOTests, Worker, ChatTokenizer
 
 
@@ -56,7 +56,8 @@ class RecoveryTests(unittest.TestCase):
                     self.assertEqual(sum(result.loss_mask), sum(len(c)+1 for c in generated))
                     self.assertIn('cleanup', result.metadata['appworld']['timings'])
                 else:
-                    with self.assertRaises((RuntimeError, TimeoutError)):
+                    expected = ExecuteRecoveryExhaustedError if mode == 'exhaust' else (RuntimeError, TimeoutError)
+                    with self.assertRaises(expected):
                         asyncio.run(operation)
             events = [json.loads(line) for line in next((Path(directory)/'episodes').glob('*.jsonl')).read_text().splitlines()]
             self.assertIn('timeout', [e['event'] for e in events])
