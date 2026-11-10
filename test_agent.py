@@ -96,6 +96,20 @@ class AgentTests(unittest.TestCase):
         self.assertIsInstance(results[1], ContextLimit)
         self.assertEqual(results[2][1]['completion_token_ids'], [8, 8, 9])
 
+    def test_repeated_execution_error_evaluates_current_world(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            world = FAKE_WORLD.replace('else "2"', 'else "Execution failed: example"')
+            (root / 'appworld.py').write_text(world)
+            backend = SimpleNamespace(generate=lambda _: ('print(1)', {}))
+            args = SimpleNamespace(appworld_python=sys.executable, appworld_root=root,
+                env_timeout=10, max_steps=5, seed=123, verbose=False, repeated_execution_error_limit=2)
+            with patch.dict(os.environ, {'PYTHONPATH': str(root)}):
+                result = run_episode(args, backend, 'fake_task_1', 'repeat', root)
+            self.assertEqual(result['termination'], 'repeated_execution_error')
+            self.assertEqual(result['steps'], 2)
+            self.assertTrue(result['evaluated'])
+
     def test_syntax_retry_is_not_an_api_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

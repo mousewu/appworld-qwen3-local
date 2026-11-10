@@ -132,6 +132,11 @@ def execution_feedback(observation):
     return header + '\n' + observation, failed
 
 
+def execution_error_key(tree, observation):
+    """Match identical failed code and the final exception, ignoring traceback locations."""
+    return ast.dump(tree, include_attributes=False), observation.strip().splitlines()[-1].strip()
+
+
 def build_summary(results, planned):
     n = len(results)
     successes = [r for r in results if r['success']]
@@ -352,6 +357,8 @@ def run_episode(args, backend, task_id, run_name, out_dir):
         termination='error', error=None)
     path = out_dir / f'{task_id}.jsonl'
     started = time.monotonic()
+    repeat_limit = getattr(args, 'repeated_execution_error_limit', 0)
+    repeated_errors = Counter()
     try:
         worker = WorldProcess(args.appworld_python, args.appworld_root, args.env_timeout)
         task = worker.call('reset', task_id=task_id, experiment_name=run_name,
@@ -373,6 +380,7 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                 result['completion_tokens'] += generation.get('completion_tokens',
                     (generation.get('usage') or {}).get('completion_tokens', 0))
                 messages.append(dict(role='assistant', content=raw))
+                repeat_triggered = False
                 try:
                     code = extract_code(raw)
                 except (ValueError, SyntaxError) as exc:
@@ -394,6 +402,10 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                     result['authentication_errors'] += int(bool(re.search(
                         r'Response status code is\s+(401|403)\b', raw_observation)))
                     declared_done = execution['declared_done']
+                    if repeat_limit and execution_failed and not declared_done:
+                        key = execution_error_key(ast.parse(code), raw_observation)
+                        repeated_errors[key] += 1
+                        repeat_triggered = repeated_errors[key] >= repeat_limit
                 if getattr(args, 'observation_tokens', 0):
                     from observation_filter import bound_observation
                     owner = getattr(backend, 'backend', backend)
@@ -409,6 +421,9 @@ def run_episode(args, backend, task_id, run_name, out_dir):
                     print(raw, '\nOBSERVATION:\n', observation, flush=True)
                 if declared_done:
                     result.update(declared_done=True, termination='declared_done')
+                    break
+                if repeat_triggered:
+                    result['termination'] = 'repeated_execution_error'
                     break
                 messages.append(dict(role='user', content=observation))
             else:
@@ -453,6 +468,8 @@ def parse_args():
     selection = p.add_mutually_exclusive_group()
     selection.add_argument('--limit', type=int, default=1, help='Default: one task; 0 means all selected tasks')
     selection.add_argument('--all-tasks', action='store_true', help='Run every task in the selected split once')
+    p.add_argument('--repeated-execution-error-limit', type=int, default=0,
+                   help='Evaluate early after the same code and error recur (0 disables)')
     p.add_argument('--max-steps', type=int, default=50)
     p.add_argument('--max-new-tokens', type=int, default=1024)
     p.add_argument('--context-length', type=int, default=32768)
@@ -480,7 +497,7 @@ def parse_args():
         p.error('--model is required for Transformers')
     if min(a.max_steps, a.max_new_tokens, a.context_length, a.env_timeout, a.model_timeout) <= 0:
         p.error('Budgets and timeouts must be positive')
-    if (a.limit < 0 or a.temperature < 0 or not 0 < a.top_p <= 1
+    if (a.limit < 0 or a.repeated_execution_error_limit < 0 or a.temperature < 0 or not 0 < a.top_p <= 1
             or a.concurrency < 1 or a.inference_batch_size < 1 or a.batch_wait_ms < 0):
         p.error('Invalid limit or sampling parameters')
     if a.observation_tokens and (a.observation_tokens < 128 or not a.model):

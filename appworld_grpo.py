@@ -11,7 +11,7 @@ import uuid
 import weakref
 
 from observation_filter import bound_observation
-from run_agent import (WorldProcess, chat_input_ids, extract_code, execution_feedback,
+from run_agent import (WorldProcess, chat_input_ids, extract_code, execution_error_key, execution_feedback,
                        format_error_feedback, normalize_input_ids, prompt_messages)
 
 
@@ -237,13 +237,12 @@ async def run_episode(args, sample, sampling_params, tokenizer, post, worker_fac
                     if repeat_limit and failed and not done:
                         # Ignore traceback locations and code formatting. Other actions,
                         # such as looking up API docs, do not erase a failed action.
-                        error = result['observation'].strip().splitlines()[-1].strip()
-                        key = (ast.dump(tree, include_attributes=False), error)
+                        key = execution_error_key(tree, result['observation'])
                         repeated_errors[key] += 1
                         repeat_triggered = repeated_errors[key] >= repeat_limit
                         if repeat_triggered:
                             record('repeated_execution_error', turn=turn+1,
-                                   occurrences=repeated_errors[key], error=error)
+                                   occurrences=repeated_errors[key], error=key[1])
                     if execute_budget and execute_seconds() >= execute_budget:
                         budget_triggered = True
                         record('execute_budget_reached', turn=turn+1, seconds=execute_seconds(),

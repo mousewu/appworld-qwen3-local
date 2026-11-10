@@ -229,3 +229,51 @@ unchanged. Full-log/file synchronization is covered by CPU subprocess tests, inc
 stderr, Unicode, lines longer than the UI limit, exit status, file allowlisting and
 resubmission after change. Cloud delivery and a live GPU/Ray run still need verification
 in the server environment.
+
+### Compare five checkpoints on held-out tasks
+
+Run from the project checkout with the existing evaluation dependencies and
+AppWorld dataset. Pass five standalone Hugging Face model directories:
+
+```bash
+python compare_checkpoints.py \
+  --appworld-root /path/to/appworld-data \
+  --appworld-python /path/to/appworld-env/bin/python \
+  --sft /path/to/sft/hf \
+  --previous-final /path/to/previous-run/hf \
+  --rl-100 /path/to/exported/rl-100 \
+  --rl-200 /path/to/exported/rl-200 \
+  --rl-300 /path/to/current-run/hf \
+  --output-dir /path/to/new/checkpoint-comparison
+```
+
+The launcher freezes all Dev task IDs before evaluating any checkpoint and
+uses greedy decoding, seed 123, 50 interactions, 512 new tokens per turn,
+16,384 context tokens, a 2,048-token observation cap and a 120-second environment
+RPC timeout. The same failed code/error pair twice triggers early termination
+and normal AppWorld evaluation. Use `--limit 1` and a separate output directory
+for a smoke test. Models are loaded one at a time.
+
+`manifest.json` lists the exact tasks and settings. `comparison.csv` and
+`comparison.json` report success rate, average generated interaction steps
+and repeated-error termination rate, all over the fixed task count. Evaluator
+errors stay in the denominator and are reported separately. Each model folder
+contains the individual task results and traces.
+
+The existing launcher passes a fixed `--save-hf <run>/hf` path, which typically
+contains only the most recent export. For intermediate checkpoints, inspect
+the saved Megatron steps in `<run>/checkpoints` and export each selected step
+to its own HF directory using the training Slime environment. The local Slime
+checkout's Torch Distributed converter takes an iteration directory containing
+`common.pt`:
+
+```bash
+python "$SLIME_DIR/tools/convert_torch_dist_to_hf.py" \
+  --input-dir /path/to/selected/iteration-directory \
+  --origin-hf-dir /path/to/sft/hf \
+  --output-dir /path/to/exported/rl-100
+```
+
+Repeat for the 200-update checkpoint. The logged rollout IDs are zero-based
+(99, 199 and 299 for 100, 200 and 300 updates). Confirm checkpoint naming in
+the server's save logs and check the converter's `--help` in that environment.
