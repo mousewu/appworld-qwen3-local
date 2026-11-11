@@ -18,7 +18,8 @@ class Work:
 
 
 class GroupQueue:
-    def __init__(self, source, generate_group, *, capacity, concurrency, max_lag, max_retries, max_consecutive_timeouts=3):
+    def __init__(self, source, generate_group, *, capacity, concurrency, max_lag, max_retries,
+                 max_consecutive_timeouts=3, group_size=4):
         self.source = source
         self.generate_group = generate_group
         self.capacity = capacity
@@ -39,6 +40,7 @@ class GroupQueue:
         self.skips_since_progress = 0
         self.consecutive_timeouts = 0
         self.max_consecutive_timeouts = max_consecutive_timeouts
+        self.group_size = group_size
 
     @property
     def size(self):
@@ -79,8 +81,8 @@ class GroupQueue:
             return
         try:
             group = task.result()
-            if len(group) != 4:
-                raise ValueError('AppWorld async requires exactly four trajectories per group')
+            if len(group) != self.group_size:
+                raise ValueError(f'AppWorld async requires exactly {self.group_size} trajectories per group')
             if any(s.status == s.Status.ABORTED for s in group):
                 self._retry_abort(work)
             else:
@@ -162,8 +164,9 @@ class GroupQueue:
             desired = remaining if final else self.capacity
             while self.size < desired:
                 originals = self.source.get_samples(1)
-                if len(originals) != 1 or len(originals[0]) != 4:
-                    raise ValueError('Slime data source must provide one complete four-sample prompt group')
+                if len(originals) != 1 or len(originals[0]) != self.group_size:
+                    raise ValueError('Slime data source must provide one complete '
+                                     f'{self.group_size}-sample prompt group')
                 self.pending.append(Work(originals[0]))
             if not remaining:
                 break
@@ -225,7 +228,8 @@ async def _collect(args, rollout_id, data_source):
         _queue = GroupQueue(data_source, generate_group, capacity=cfg['async_group_capacity'],
                             concurrency=cfg['async_inflight_groups'], max_lag=cfg['async_max_policy_lag'],
                             max_retries=cfg['async_group_retries'],
-                            max_consecutive_timeouts=cfg.get('async_max_consecutive_timeouts', 3))
+                            max_consecutive_timeouts=cfg.get('async_max_consecutive_timeouts', 3),
+                            group_size=args.n_samples_per_prompt)
     try:
         final = rollout_id == args.num_rollout - 1
         groups, metrics = await _queue.collect(rollout_id, args.rollout_batch_size, final=final)

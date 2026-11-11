@@ -29,7 +29,8 @@ test -f "$TERMINAL_RSI_DIR/slime_plugins/harbor/tb_gae.py"
 ```
 
 项目不安装或改写 Slime/Megatron。`PYTHONPATH` 将本项目兼容插件放在前面，并通过 namespace
-继续使用 Terminal-RSI 的 `slime_plugins.harbor.tb_gae` 和 `train_loss`。
+继续使用 Terminal-RSI 的 `slime_plugins.harbor.tb_gae` 和 `train_loss`。项目的同名 rollout 入口
+在不改变 TB-GAE 校验路径的前提下，提供完整任务组的有界持续供给。
 
 ## 2. 冻结 AppWorld 奖励尺度
 
@@ -110,7 +111,11 @@ bash run_rpr_4gpu.sh \
 - rollout context 16K，训练 chunk cap 8K，因此超过 8K 的完整轨迹会实际验证跨 chunk TB-GAE；
 - 每任务一次独立 rollout，不做 GRPO 组内归一化；
 - 只训练动作 token，观察 token 只作为条件；
-- 每个有限时域 AppWorld episode 在最后动作处终止，环境超时/基础设施错误仍抛出而不记作失败。
+- 每个有限时域 AppWorld episode 在最后动作处终止；单个 execute 超时重放耗尽时丢弃整个任务组并
+  补充新任务，连续 3 个任务组都耗尽才终止训练，基础设施错误不会被伪装成奖励 0；
+- 相同动作与异常默认重复 2 次便提前进入最终评估；无限 `while True` 异常重试代码不会提交给环境；
+- 4 卡默认最多保留 32 个 pending/active/ready 任务组、并发 24 个，策略滞后最多 1 个 actor update；
+  abort 最多重试 3 次，之后换一个新任务组。
 
 ## 5. 生成并训练 RSR-2 Actor
 
@@ -191,3 +196,13 @@ SwanLab 会同步 Slime 原生 actor/critic/value/clip 指标、`appworld_rpr/*`
 完整日志和退出分类。每次运行还保存不可变的 `reward_scales.json`、实际角色 LR 配置、TB-GAE 配置
 和完整命令。若进程异常结束，先检查 `exit_diagnosis.json`；如果训练在参数解析阶段终止，检查
 `training.log` 中 Terminal-RSI TB-GAE preflight 的具体契约错误。
+
+环境容错重点观察：
+
+- `appworld_rpr/async/aborted_resampled_total` 与 `aborted_skipped_total`；
+- `appworld_rpr/async/execute_timeout_skipped_total`、跳过率及 `termination/repeated_execution_error`；
+- `appworld_rpr/unbounded_retry_rejections`。
+
+可用 `RPR_GROUP_CAPACITY`、`RPR_INFLIGHT_GROUPS`、`RPR_MAX_POLICY_LAG`、
+`RPR_GROUP_RETRIES`、`RPR_MAX_CONSECUTIVE_TIMEOUTS` 和
+`REPEATED_EXECUTION_ERROR_LIMIT` 覆盖启动脚本默认值。

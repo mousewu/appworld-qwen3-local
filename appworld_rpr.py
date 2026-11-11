@@ -146,7 +146,11 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
         'execute_budget_trigger_rate': sum(bool(row.get('execute_budget_triggered'))
                                            for row in summaries)/len(summaries),
         'timeout_recoveries': sum(row.get('timeout_recoveries', 0) for row in summaries),
+        'unbounded_retry_rejections': sum(row.get('unbounded_retry_rejections', 0)
+                                          for row in summaries),
     }
+    for key, value in (rollout_extra_metrics or {}).items():
+        metrics[key] = value
     for reason, count in Counter(row['termination'] for row in summaries).items():
         metrics['termination/'+reason] = count
     path = Path(config()['output_dir'])/'project_metrics'/f'{rollout_id:08d}.json'

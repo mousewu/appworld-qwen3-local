@@ -251,9 +251,20 @@ def parse_args(argv=None):
     parser.add_argument('--observation-tokens', type=int, default=2048)
     parser.add_argument('--max-envs', type=int, default=24)
     parser.add_argument('--server-concurrency', type=int, default=16)
+    parser.add_argument('--async-group-capacity', type=int,
+                        help='Bounded pending/active/ready task groups; default: 2 * batch-size')
+    parser.add_argument('--async-inflight-groups', type=int,
+                        help='Concurrent task groups; default: max-envs')
+    parser.add_argument('--async-max-policy-lag', type=int, default=1)
+    parser.add_argument('--async-group-retries', type=int, default=3,
+                        help='Maximum retries of an aborted task group before replacing it')
+    parser.add_argument('--async-max-consecutive-timeouts', type=int, default=3,
+                        help='Stop after this many consecutive exhausted execute-timeout groups')
     parser.add_argument('--env-timeout', type=float, default=120)
     parser.add_argument('--env-timeout-retries', type=int, default=1)
     parser.add_argument('--env-execute-budget-seconds', type=float, default=300)
+    parser.add_argument('--repeated-execution-error-limit', type=int, default=2,
+                        help='End and evaluate after the same action/error repeats (0 disables)')
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--actor-lr', type=float)
     parser.add_argument('--critic-lr', type=float, default=1.5e-5)
@@ -274,6 +285,10 @@ def parse_args(argv=None):
     if args.terminal_rsi_dir is None:
         parser.error('Set --terminal-rsi-dir or TERMINAL_RSI_DIR')
     args.actor_lr = args.actor_lr or PHASES[args.phase]['actor_lr']
+    if args.async_group_capacity is None:
+        args.async_group_capacity = 2 * args.batch_size
+    if args.async_inflight_groups is None:
+        args.async_inflight_groups = args.max_envs
     for key in ('model','load_root','terminal_rsi_dir','appworld_root','reward_scales','output_dir'):
         setattr(args, key, getattr(args, key).expanduser().resolve())
     return args
@@ -283,13 +298,19 @@ def main(argv=None):
     a = parse_args(argv)
     positive = [a.num_gpus,a.actor_gpus,a.tp_size,a.rollout_tp,a.batch_size,a.updates,
                 a.context_length,a.train_max_tokens,a.max_steps,a.max_new_tokens,a.max_envs,
-                a.server_concurrency,a.env_timeout,a.actor_lr,a.critic_lr,a.save_interval]
+                a.server_concurrency,a.async_group_capacity,a.async_inflight_groups,
+                a.async_max_consecutive_timeouts,a.env_timeout,a.actor_lr,a.critic_lr,a.save_interval]
     if any(value <= 0 for value in positive) or not 0 < a.gamma_turn <= 1 or not 0 < a.lambda_turn <= 1:
         raise SystemExit('Counts/LRs must be positive and turn discounts must be in (0,1]')
     if a.critic_only_steps < 0 or a.critic_only_steps >= a.updates and a.phase != 'warmup':
         raise SystemExit('RPR critic-only steps must leave at least one joint actor/critic update')
     if a.train_max_tokens > a.context_length or not 0 < a.sglang_memory < 1:
         raise SystemExit('Train token cap must not exceed context; SGLang memory must be in (0,1)')
+    if a.async_group_capacity < a.batch_size or a.async_inflight_groups > a.async_group_capacity:
+        raise SystemExit('Async group capacity must cover the batch and concurrent groups')
+    if (a.async_max_policy_lag < 0 or a.async_group_retries < 0
+            or a.repeated_execution_error_limit < 0):
+        raise SystemExit('Async lag/retry and repeated-error limits must be nonnegative')
     if a.output_dir.exists():
         raise SystemExit('Output directory must not exist')
     a.terminal_rsi_dir = validate_terminal_rsi(a.terminal_rsi_dir)

@@ -220,3 +220,46 @@ class GroupQueueTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ExceptionGroup, 'mixed'):
             await asyncio.wait_for(queue.collect(0, 1), 1)
         self.assertEqual(queue.counts['execute_timeout_skipped'], 0)
+
+    async def test_single_trajectory_groups_support_rpr_timeout_replacement(self):
+        class SingleSource(Source):
+            def get_samples(self, count):
+                groups = super().get_samples(count)
+                return [[group[0]] for group in groups]
+
+        async def generate(group):
+            if ids([group]) == [0]:
+                raise ExecuteRecoveryExhaustedError('execute')
+            return await complete(group)
+
+        queue = GroupQueue(SingleSource(), generate, capacity=2, concurrency=2,
+                           max_lag=1, max_retries=1, group_size=1)
+        self.addAsyncCleanup(queue.close)
+        groups, metrics = await asyncio.wait_for(queue.collect(0, 1, final=True), 1)
+        self.assertEqual(ids(groups), [1])
+        self.assertEqual(len(groups[0]), 1)
+        self.assertEqual(metrics['async/execute_timeout_skipped_total'], 1)
+
+    async def test_single_trajectory_groups_bound_rpr_abort_retries(self):
+        class SingleSource(Source):
+            def get_samples(self, count):
+                groups = super().get_samples(count)
+                return [[group[0]] for group in groups]
+
+        attempts = Counter()
+
+        async def generate(group):
+            gid = ids([group])[0]
+            attempts[gid] += 1
+            await complete(group)
+            if gid == 0:
+                group[0].status = STATUS.ABORTED
+            return group
+
+        queue = GroupQueue(SingleSource(), generate, capacity=1, concurrency=1,
+                           max_lag=1, max_retries=1, group_size=1)
+        self.addAsyncCleanup(queue.close)
+        groups, metrics = await asyncio.wait_for(queue.collect(0, 1, final=True), 1)
+        self.assertEqual(ids(groups), [1])
+        self.assertEqual(attempts[0], 2)
+        self.assertEqual(metrics['async/aborted_skipped_total'], 1)

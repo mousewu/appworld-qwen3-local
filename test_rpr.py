@@ -3,18 +3,21 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
+from types import ModuleType
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from appworld_grpo import run_episode
-from appworld_rpr import fdr_rewards, shaped_reward, spr_rewards
+from appworld_grpo import ExecuteRecoveryExhaustedError, run_episode
+from appworld_rpr import fdr_rewards, log_rollout_data, shaped_reward, spr_rewards
 from build_rsr2_sft import replay_episode, select_episodes
 from calibrate_rpr_rewards import nearest_rank_percentile, summarize
 from prepare_rpr_load_root import prepare
 from run_rpr import architecture_args, main as rpr_main, training_args, write_role_config, write_task_config
 from test_grpo import ChatTokenizer, Worker
+import slime_plugins.harbor.rollout as rpr_rollout
 
 
 class RPRTests(unittest.TestCase):
@@ -77,6 +80,98 @@ class RPRTests(unittest.TestCase):
         self.assertEqual(nearest_rank_percentile([1,2,10], 90), 10)
         self.assertEqual(report['family_divisors'], {'a':10.0, 'b':4.0})
         self.assertEqual(report['global_divisor'], 10.0)
+
+    def test_rpr_metrics_include_queue_and_action_rejection_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scales = Path(directory)/'scales.json'
+            scales.write_text(json.dumps(dict(global_divisor=4, family_divisors={'family':4})))
+            cfg = self.config(directory, scales)
+            sample = self.sample(False)
+            sample.loss_mask = [1, 0, 1]
+            sample.metadata['appworld'].update(steps=2, termination='repeated_execution_error',
+                execute_budget_triggered=False, timeout_recoveries=1,
+                unbounded_retry_rejections=1)
+            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)):
+                self.assertFalse(log_rollout_data(3, None, [[sample]],
+                    {'async/execute_timeout_skipped_total': 2,
+                     'async/aborted_skipped_total': 1}, 12.5))
+            report = json.loads((Path(directory)/'project_metrics/00000003.json').read_text())
+            metrics = report['metrics']
+            self.assertEqual(metrics['appworld_rpr/unbounded_retry_rejections'], 1)
+            self.assertEqual(metrics['appworld_rpr/async/execute_timeout_skipped_total'], 2)
+            self.assertEqual(metrics['appworld_rpr/async/aborted_skipped_total'], 1)
+            self.assertEqual(metrics['appworld_rpr/termination/repeated_execution_error'], 1)
+
+    def test_validated_rpr_rollout_replaces_timeout_and_runs_tb_postprocess(self):
+        class Output:
+            def __init__(self, samples, metrics):
+                self.samples = samples
+                self.metrics = metrics
+
+        class GenerateState:
+            def __init__(self, args):
+                self.sampling_params = {'temperature': .8}
+
+        class Source:
+            def __init__(self):
+                self.next_id = 0
+
+            def get_samples(self, count):
+                self.assert_count = count
+                index = self.next_id
+                self.next_id += 1
+                status = SimpleNamespace(PENDING='pending', COMPLETED='completed', ABORTED='aborted')
+                sample = SimpleNamespace(index=index, group_index=index,
+                    metadata={'task_id': f'task_{index}'}, Status=status,
+                    status=status.PENDING, reward=None)
+                return [[sample]]
+
+        processed = []
+
+        async def generate(args, sample, params):
+            self.assertEqual(params, {'temperature': .8})
+            if sample.index == 0:
+                raise ExecuteRecoveryExhaustedError('execute')
+            sample.status = sample.Status.COMPLETED
+            sample.reward = 0.0
+            return sample
+
+        def process(args, groups, source):
+            processed.extend(groups)
+
+        def load_function(path):
+            return {'fake.generate': generate, 'fake.process': process}[path]
+
+        modules = {}
+        for name in ['slime', 'slime.rollout', 'slime.utils']:
+            module = ModuleType(name)
+            module.__path__ = []
+            modules[name] = module
+        base_types = ModuleType('slime.rollout.base_types')
+        base_types.RolloutFnTrainOutput = Output
+        modules[base_types.__name__] = base_types
+        sglang = ModuleType('slime.rollout.sglang_rollout')
+        sglang.GenerateState = GenerateState
+        modules[sglang.__name__] = sglang
+        misc = ModuleType('slime.utils.misc')
+        misc.load_function = load_function
+        modules[misc.__name__] = misc
+
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory)/'config.json'
+            cfg.write_text(json.dumps(dict(async_group_capacity=2, async_inflight_groups=2,
+                async_max_policy_lag=1, async_group_retries=1,
+                async_max_consecutive_timeouts=3)))
+            args = SimpleNamespace(custom_generate_function_path='fake.generate',
+                n_samples_per_prompt=1, num_rollout=1, rollout_batch_size=1,
+                rollout_all_samples_process_path='fake.process')
+            rpr_rollout._queue = None
+            with patch.dict(os.environ, APPWORLD_GRPO_CONFIG=str(cfg)), patch.dict(sys.modules, modules):
+                output = asyncio.run(rpr_rollout._collect(args, 0, Source()))
+            rpr_rollout._queue = None
+        self.assertEqual(output.samples[0][0].index, 1)
+        self.assertEqual(output.metrics['async/execute_timeout_skipped_total'], 1)
+        self.assertEqual(processed[0][0].index, 1)
 
     def test_prepare_paired_load_roots(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -194,6 +289,10 @@ class RPRTests(unittest.TestCase):
             self.assertEqual(command[2], str(terminal.resolve()/'train_async.py'))
             self.assertIn('appworld_rpr.fdr_rewards', command)
             self.assertEqual(json.loads((output/'project_config.json').read_text())['reward_mode'], 'fdr')
+            project = json.loads((output/'project_config.json').read_text())
+            self.assertEqual(project['async_group_capacity'], 32)
+            self.assertEqual(project['async_inflight_groups'], 24)
+            self.assertEqual(project['repeated_execution_error_limit'], 2)
 
 
 if __name__ == '__main__':
