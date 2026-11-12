@@ -7,6 +7,10 @@ Slime 源码；项目插件只负责本地 AppWorld rollout、FDR/SPR 和监控�
 默认 4 卡拓扑：GPU 0–1 放 TP2 Actor 与 Critic，GPU 2–3 各运行一个 TP1 rollout engine。
 Actor/Critic optimizer 使用 CPU offload。`run_rpr_8gpu.sh` 保持两张训练卡并将 rollout 扩到六张。
 
+完整实验也可以使用 [`scripts/rpr/`](scripts/rpr/README.md) 中的编号脚本逐阶段运行。公共路径和
+超参数集中在 `scripts/rpr/config.sh`，机器私有配置放在不会提交的 `config.local.sh`；
+`run_all.sh` 可从预检一直串联到 RPR-2。
+
 ## 1. 环境和运行时
 
 RPR 需要 Terminal-RSI 自带的 Slime 扩展，普通 Slime 的 GRPO 功能不能代替独立 Critic 和

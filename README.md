@@ -3,6 +3,7 @@
 > **同步 GRPO：见 [GRPO.md](GRPO.md)，入口 `bash run_grpo.sh`，支持项目端 SwanLab。**
 
 > **Terminal-RSI RPR：见 [RPR.md](RPR.md)，入口 `bash run_rpr_4gpu.sh`；包含 Warm Critic、TB-GAE、FDR/SPR、Critic 继承与 8 卡迁移配置。**
+> 分阶段实验脚本位于 [`scripts/rpr/`](scripts/rpr/README.md)，支持集中配置、上游产物校验和完整流水线启动。
 
 > **SFT 当前入口已切换到 Slime 全参训练：见 [SLIME_SFT.md](SLIME_SFT.md)。**
 > 下方 HF Trainer/LoRA 章节保留作历史替代方案。官方 0.1.1 输出包的 Train 目录为 `react_gpt4o_train`；旧版默认下载命令可能拿不到 Train 轨迹。

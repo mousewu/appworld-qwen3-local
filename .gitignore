@@ -5,3 +5,5 @@ sft_data/
 sft_outputs/
 
 grpo_runs/
+rpr_experiments/
+scripts/rpr/config.local.sh
