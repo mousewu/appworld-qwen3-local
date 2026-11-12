@@ -39,6 +39,17 @@ class AsyncTests(unittest.TestCase):
                 self.assertEqual(args[args.index('--rollout-function-path')+1],
                                  'appworld_async_rollout.generate_rollout')
 
+    def test_hf_checkpoints_have_distinct_rollout_paths(self):
+        cfg = dict(model_type='qwen3', hidden_size=2560, rope_theta=5000000,
+                   max_position_embeddings=262144)
+        options = arguments('project')
+        args = training_args(options, Path('/data'), Path('/out'), cfg)
+        template = args[args.index('--save-hf') + 1]
+        self.assertEqual([template.format(rollout_id=step) for step in (99, 199, 299)],
+                         ['/out/hf/rollout_000099', '/out/hf/rollout_000199', '/out/hf/rollout_000299'])
+        options.no_save_hf = True
+        self.assertNotIn('--save-hf', training_args(options, Path('/data'), Path('/out'), cfg))
+
     def test_native_async_entry_selection(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)

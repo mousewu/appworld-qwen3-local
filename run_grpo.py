@@ -75,7 +75,8 @@ def training_args(a, prompt_file, output, model_config):
     if a.tp_size > 1:
         args.append('--sequence-parallel')
     if not a.no_save_hf:
-        args += ['--save-hf',str(output/'hf')]
+        # Slime formats this path with the zero-based rollout ID at each save.
+        args += ['--save-hf', str(output / 'hf' / 'rollout_{rollout_id:06d}')]
     return args
 
 

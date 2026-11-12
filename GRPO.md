@@ -260,8 +260,14 @@ and repeated-error termination rate, all over the fixed task count. Evaluator
 errors stay in the denominator and are reported separately. Each model folder
 contains the individual task results and traces.
 
-The existing launcher passes a fixed `--save-hf <run>/hf` path, which typically
-contains only the most recent export. For intermediate checkpoints, inspect
+The launcher writes one HF directory per saved rollout under
+`<run>/hf/rollout_{rollout_id:06d}`. For example, `SAVE_INTERVAL=100` with
+300 updates saves HF exports at rollout IDs 99, 199 and 299 with the native
+Slime training loop. Point each comparison argument at its model directory.
+
+Earlier runs used a fixed `--save-hf <run>/hf` path, so their HF directory
+typically contains only the most recent export. To recover intermediate
+weights from those runs, inspect
 the saved Megatron steps in `<run>/checkpoints` and export each selected step
 to its own HF directory using the training Slime environment. The local Slime
 checkout's Torch Distributed converter takes an iteration directory containing
